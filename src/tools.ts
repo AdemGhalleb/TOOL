@@ -13,6 +13,37 @@ import type {ToolSpec} from './types.ts';
 
 const MAX_TEXT = 12_000;
 
+const COMMAND_ENV_ALLOWLIST = [
+  'PATH',
+  'HOME',
+  'TMPDIR',
+  'TEMP',
+  'TMP',
+  'LANG',
+  'LC_ALL',
+  'SYSTEMROOT',
+  'WINDIR',
+  'PATHEXT',
+  'COMSPEC',
+] as const;
+
+export function buildCommandEnvironment(
+  source: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {};
+
+  for (const name of COMMAND_ENV_ALLOWLIST) {
+    const key = Object.keys(source).find(
+      candidate => candidate.toUpperCase() === name,
+    );
+    if (key !== undefined && source[key] !== undefined) {
+      environment[key] = source[key];
+    }
+  }
+
+  return environment;
+}
+
 function requiredString(
   args: Record<string, unknown>,
   name: string,
@@ -335,7 +366,7 @@ const runCommandTool: ToolSpec = {
 
     // Capture bounded command output from the canonical workspace.
     return await new Promise<unknown>(done => {
-      exec(command, {cwd: context.workspaceRoot, encoding: 'utf8', timeout: 10_000, maxBuffer: 1_000_000}, (error, stdout, stderr) => {
+      exec(command, {cwd: context.workspaceRoot, encoding: 'utf8', timeout: 10_000, maxBuffer: 1_000_000, env: buildCommandEnvironment()}, (error, stdout, stderr) => {
         const exitCode = error && typeof error.code === 'number' ? error.code : error ? 1 : 0;
         done({approved: true, exitCode, stdout: String(stdout).slice(0, MAX_TEXT), stderr: String(stderr).slice(0, MAX_TEXT), error: error?.message ?? null});
       });
