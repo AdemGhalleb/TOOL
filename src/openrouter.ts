@@ -11,6 +11,7 @@ export const MODEL = 'openrouter/free';
 export async function callModel(
   messages: Message[],
   tools: ToolSpec[],
+  signal?: AbortSignal,
 ): Promise<AssistantMessage> {
   const apiKey = (
     globalThis as typeof globalThis & {
@@ -38,6 +39,7 @@ export async function callModel(
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(body),
+    signal,
   });
 
   if (!response.ok) {

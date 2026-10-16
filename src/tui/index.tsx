@@ -1,6 +1,7 @@
 import {useState} from 'react';
 import {Box, Text, render} from 'ink';
 import TextInput from 'ink-text-input';
+import {AgentRunLimitError} from '../agent.ts';
 import type {AgentHooks} from '../types.ts';
 
 // Let the TUI pass interface hooks into the harness boundary.
@@ -99,7 +100,13 @@ function App({respond}: AppProps) {
       append({role: 'agent', text: response});
     } catch (error) {
       console.error('Agent response failed:', error);
-      append({role: 'error', text: 'Something went wrong. Try again.'});
+      append({
+        role: 'error',
+        text:
+          error instanceof AgentRunLimitError
+            ? error.message
+            : 'Something went wrong. Try again.',
+      });
     } finally {
       setIsThinking(false);
     }
