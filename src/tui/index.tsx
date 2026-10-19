@@ -2,6 +2,7 @@ import {useState} from 'react';
 import {Box, Text, render} from 'ink';
 import TextInput from 'ink-text-input';
 import {AgentRunLimitError} from '../agent.ts';
+import {ToolCancellationError} from '../types.ts';
 import type {AgentHooks} from '../types.ts';
 
 // Let the TUI pass interface hooks into the harness boundary.
@@ -19,6 +20,8 @@ type TranscriptEntry = {
 type PendingApproval = {
   action: string;
   resolve: (approved: boolean) => void;
+  reject: (error: unknown) => void;
+  settled: boolean;
 };
 
 type AppProps = {
@@ -63,6 +66,7 @@ function App({respond}: AppProps) {
       role: 'approval',
       text: `${approved ? 'Approved' : 'Denied'}: ${pending.action}`,
     });
+    pending.settled = true;
     pending.resolve(approved);
     return true;
   }
@@ -88,9 +92,26 @@ function App({respond}: AppProps) {
       emit(text) {
         append({role: 'event', text});
       },
-      approve(action) {
-        return new Promise<boolean>(resolveApproval => {
-          setApproval({action, resolve: resolveApproval});
+      approve(action, signal) {
+        return new Promise<boolean>((resolveApproval, rejectApproval) => {
+          const pending: PendingApproval = {
+            action,
+            resolve: resolveApproval,
+            reject: rejectApproval,
+            settled: false,
+          };
+          const cancel = () => {
+            if (pending.settled) return;
+            pending.settled = true;
+            setApproval(current => current === pending ? null : current);
+            pending.reject(new ToolCancellationError());
+          };
+          if (signal?.aborted) {
+            cancel();
+            return;
+          }
+          signal?.addEventListener('abort', cancel, {once: true});
+          setApproval(pending);
         });
       },
     };

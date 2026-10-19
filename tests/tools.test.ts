@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
-import {mkdtemp, mkdir, rm, symlink, writeFile} from 'node:fs/promises';
+import {mkdtemp, mkdir, readFile, rm, symlink, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {test} from 'node:test';
 import {buildCommandEnvironment, SEARCH_LIMITS, tools} from '../src/tools.ts';
+import {ToolCancellationError} from '../src/types.ts';
 
 const searchTool = tools.find(
   tool => tool.definition.function.name === 'search_directory',
+);
+const writeTool = tools.find(
+  tool => tool.definition.function.name === 'write_file',
 );
 
 function search(workspaceRoot: string, query: string, path = '.'): Promise<unknown> {
@@ -186,6 +190,42 @@ test('search_directory tolerates files disappearing during a search', async () =
       matches: [],
       truncated: false,
     });
+  });
+});
+
+test('a normal approval permits a write operation', async () => {
+  await withTempWorkspace(async workspaceRoot => {
+    assert.ok(writeTool);
+    const result = await writeTool.execute(
+      {path: 'approved.txt', content: 'saved'},
+      {workspaceRoot, emit: () => {}, approve: async () => true},
+    );
+
+    assert.deepEqual(result, {approved: true, path: 'approved.txt'});
+    assert.equal(await readFile(join(workspaceRoot, 'approved.txt'), 'utf8'), 'saved');
+  });
+});
+
+test('cancellation immediately after approval prevents a write', async () => {
+  await withTempWorkspace(async workspaceRoot => {
+    assert.ok(writeTool);
+    const controller = new AbortController();
+    await assert.rejects(
+      writeTool.execute(
+        {path: 'expired.txt', content: 'must not save'},
+        {
+          workspaceRoot,
+          emit: () => {},
+          approve: async () => {
+            controller.abort();
+            return true;
+          },
+          signal: controller.signal,
+        },
+      ),
+      ToolCancellationError,
+    );
+    await assert.rejects(readFile(join(workspaceRoot, 'expired.txt'), 'utf8'));
   });
 });
 

@@ -11,6 +11,7 @@ import {
 } from 'node:fs/promises';
 import {StringDecoder} from 'node:string_decoder';
 import {dirname, isAbsolute, relative, resolve, sep} from 'node:path';
+import {ToolCancellationError} from './types.ts';
 import type {ToolSpec} from './types.ts';
 
 const MAX_TEXT = 12_000;
@@ -35,6 +36,12 @@ const COMMAND_ENV_ALLOWLIST = [
   'PATHEXT',
   'COMSPEC',
 ] as const;
+
+function assertActive(context: {signal?: AbortSignal}): void {
+  if (context.signal?.aborted) {
+    throw new ToolCancellationError();
+  }
+}
 
 export function buildCommandEnvironment(
   source: NodeJS.ProcessEnv = process.env,
@@ -382,7 +389,10 @@ const writeFileTool: ToolSpec = {
     const content = requiredString(args, 'content', true);
     const target = mutationPath(context.workspaceRoot, path);
     await assertNoSymlinkPath(context.workspaceRoot, target);
-    if (!(await context.approve(`write ${path}`))) return {approved: false};
+    if (!(await context.approve(`write ${path}`, context.signal))) {
+      return {approved: false};
+    }
+    assertActive(context);
 
     // Apply only an approved workspace mutation.
     await mkdir(dirname(target), {recursive: true});
@@ -419,7 +429,10 @@ const editFileTool: ToolSpec = {
     const source = await readFile(target, 'utf8');
     const count = source.split(oldText).length - 1;
     if (count !== 1) throw new Error(`old_text must occur exactly once; found ${count}.`);
-    if (!(await context.approve(`edit ${path}`))) return {approved: false};
+    if (!(await context.approve(`edit ${path}`, context.signal))) {
+      return {approved: false};
+    }
+    assertActive(context);
     await writeFile(target, source.replace(oldText, newText), 'utf8');
     return {approved: true, path};
   },
@@ -444,7 +457,10 @@ const deleteFileTool: ToolSpec = {
     const path = requiredString(args, 'path');
     const target = mutationPath(context.workspaceRoot, path);
     await assertNoSymlinkPath(context.workspaceRoot, target);
-    if (!(await context.approve(`delete ${path}`))) return {approved: false};
+    if (!(await context.approve(`delete ${path}`, context.signal))) {
+      return {approved: false};
+    }
+    assertActive(context);
 
     await unlink(target);
     return {approved: true, path};
@@ -469,9 +485,10 @@ const runCommandTool: ToolSpec = {
   },
   async execute(args, context) {
     const command = requiredString(args, 'command');
-    if (!(await context.approve(`run shell command: ${command}`))) {
+    if (!(await context.approve(`run shell command: ${command}`, context.signal))) {
       return {approved: false};
     }
+    assertActive(context);
 
     // Capture bounded command output from the canonical workspace.
     return await new Promise<unknown>(done => {

@@ -4,6 +4,7 @@ import {
   AgentRunLimitError,
   runAgent,
 } from '../src/agent.ts';
+import {ToolCancellationError} from '../src/types.ts';
 import type {AssistantMessage, ToolSpec} from '../src/types.ts';
 
 const context = {
@@ -164,4 +165,107 @@ test('tool errors remain tool results and the model can complete normally', asyn
   );
 
   assert.equal(result.answer, 'completed with the tool error');
+});
+
+test('a cancelled run cannot start a tool operation', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  let toolCalls = 0;
+
+  await assert.rejects(
+    runAgent(
+      'cancelled',
+      context,
+      [],
+      [tool(async () => { toolCalls += 1; return 'unexpected'; })],
+      {signal: controller.signal, callModel: async () => toolCall()},
+    ),
+    (error: unknown) =>
+      error instanceof AgentRunLimitError && error.limit === 'deadline',
+  );
+  assert.equal(toolCalls, 0);
+});
+
+test('cancellation rejects a pending approval and prevents its side effect', async () => {
+  const controller = new AbortController();
+  let approvalReject: ((error: unknown) => void) | undefined;
+  let sideEffects = 0;
+  const approvalContext = {
+    ...context,
+    approve: (_action: string, signal?: AbortSignal) =>
+      new Promise<boolean>((resolve, reject) => {
+        approvalReject = reject;
+        signal?.addEventListener(
+          'abort',
+          () => reject(new ToolCancellationError()),
+          {once: true},
+        );
+      }),
+  };
+
+  const run = runAgent(
+    'approve later',
+    approvalContext,
+    [],
+    [tool(async (_args, toolContext) => {
+      await toolContext.approve('protected action', toolContext.signal);
+      if (toolContext.signal?.aborted) throw new ToolCancellationError();
+      sideEffects += 1;
+      return 'done';
+    })],
+    {signal: controller.signal, callModel: async () => toolCall()},
+  );
+
+  await new Promise<void>(resolve => queueMicrotask(resolve));
+  controller.abort();
+  approvalReject?.(new ToolCancellationError());
+
+  await assert.rejects(
+    run,
+    (error: unknown) =>
+      error instanceof AgentRunLimitError && error.limit === 'deadline',
+  );
+  assert.equal(sideEffects, 0);
+});
+
+test('approval cancellation is isolated to its own run', async () => {
+  const cancelled = new AbortController();
+  const other = new AbortController();
+  let cancelledCalls = 0;
+  let otherCalls = 0;
+
+  const makeContext = (counter: {value: number}) => ({
+    ...context,
+    approve: async (_action: string, signal?: AbortSignal) => {
+      if (signal?.aborted) throw new ToolCancellationError();
+      return true;
+    },
+  });
+
+  cancelled.abort();
+  await assert.rejects(
+    runAgent(
+      'cancel one',
+      makeContext({value: cancelledCalls}),
+      [],
+      [tool(async () => { cancelledCalls += 1; return 'no'; })],
+      {signal: cancelled.signal, callModel: async () => toolCall()},
+    ),
+    AgentRunLimitError,
+  );
+
+  const result = await runAgent(
+    'continue other',
+    makeContext({value: otherCalls}),
+    [],
+    [tool(async () => { otherCalls += 1; return 'ok'; })],
+    {
+      signal: other.signal,
+      maxIterations: 1,
+      callModel: async () => toolCall(),
+    },
+  ).catch(error => error);
+  assert.ok(result instanceof AgentRunLimitError);
+  assert.equal(cancelledCalls, 0);
+  assert.equal(otherCalls, 1);
 });

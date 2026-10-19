@@ -35,10 +35,11 @@ export interface ToolDefinition {
 
 export interface AgentHooks {
   emit(text: string): void;
-  approve(action: string): Promise<boolean>;
+  approve(action: string, signal?: AbortSignal): Promise<boolean>;
 }
 export interface ToolContext extends AgentHooks {
   workspaceRoot: string;
+  signal?: AbortSignal;
 }
 
 export interface ToolSpec {
@@ -52,6 +53,13 @@ export interface ToolSpec {
 export type ToolExecutionResult =
   | {ok: true; data: unknown}
   | {ok: false; error: string};
+
+export class ToolCancellationError extends Error {
+  constructor() {
+    super('Tool operation cancelled because the agent run ended.');
+    this.name = 'ToolCancellationError';
+  }
+}
 
 export interface ChatCompletionResponse {
   choices: Array<{

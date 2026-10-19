@@ -1,4 +1,5 @@
 import {callModel} from './openrouter.ts';
+import {ToolCancellationError} from './types.ts';
 import type {
   AgentRunResult,
   Message,
@@ -32,6 +33,7 @@ export interface AgentRunOptions {
   maxDurationMs?: number;
   now?: () => number;
   callModel?: typeof callModel;
+  signal?: AbortSignal;
 }
 
 async function executeToolCalls(
@@ -67,6 +69,9 @@ async function executeToolCalls(
       result = {ok: true, data};
     } catch (error) {
       if (error instanceof AgentRunLimitError) throw error;
+      if (error instanceof ToolCancellationError) {
+        throw new AgentRunLimitError('deadline');
+      }
       result = {
         ok: false,
         error: error instanceof Error ? error.message : String(error),
@@ -101,6 +106,10 @@ export async function runAgent(
   const deadline = now() + (options.maxDurationMs ?? MAX_AGENT_DURATION_MS);
   const maxIterations = options.maxIterations ?? MAX_AGENT_ITERATIONS;
   const controller = new AbortController();
+  const cancelRun = () => controller.abort();
+  options.signal?.addEventListener('abort', cancelRun, {once: true});
+  if (options.signal?.aborted) controller.abort();
+  const runContext: ToolContext = {...context, signal: controller.signal};
   const deadlineTimer = setTimeout(
     () => controller.abort(),
     Math.max(0, deadline - now()),
@@ -152,9 +161,16 @@ export async function runAgent(
         };
       }
 
-      await executeToolCalls(calls, messages, tools, context, checkDeadline);
+      await executeToolCalls(
+        calls,
+        messages,
+        tools,
+        runContext,
+        checkDeadline,
+      );
     }
   } finally {
     clearTimeout(deadlineTimer);
+    options.signal?.removeEventListener('abort', cancelRun);
   }
 }
