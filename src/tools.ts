@@ -1,5 +1,6 @@
 import {exec} from 'node:child_process';
 import {
+  open,
   lstat,
   mkdir,
   readdir,
@@ -8,10 +9,18 @@ import {
   unlink,
   writeFile,
 } from 'node:fs/promises';
+import {StringDecoder} from 'node:string_decoder';
 import {dirname, isAbsolute, relative, resolve, sep} from 'node:path';
 import type {ToolSpec} from './types.ts';
 
 const MAX_TEXT = 12_000;
+
+export const SEARCH_LIMITS = {
+  maxFiles: 1_000,
+  maxFileBytes: 1_024 * 1_024,
+  maxTotalBytes: 5 * 1_024 * 1_024,
+  maxMatches: 50,
+} as const;
 
 const COMMAND_ENV_ALLOWLIST = [
   'PATH',
@@ -119,9 +128,26 @@ async function assertNoSymlinkPath(
   }
 }
 
-async function walkFiles(directory: string): Promise<string[]> {
+type SearchState = {
+  filesConsidered: number;
+  bytesRead: number;
+  matches: string[];
+  truncated: boolean;
+  stop: boolean;
+};
+
+async function walkFiles(
+  directory: string,
+  visit: (file: string, state: SearchState) => Promise<void>,
+  state: SearchState,
+): Promise<void> {
+  if (state.stop || state.filesConsidered >= SEARCH_LIMITS.maxFiles) {
+    state.truncated = true;
+    state.stop = true;
+    return;
+  }
+
   const entries = await readdir(directory, {withFileTypes: true});
-  const files: string[] = [];
 
   for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
     if (entry.isSymbolicLink()) {
@@ -130,37 +156,120 @@ async function walkFiles(directory: string): Promise<string[]> {
 
     const target = resolve(directory, entry.name);
     if (entry.isDirectory()) {
-      files.push(...(await walkFiles(target)));
+      if (entry.name === '.git' || entry.name === 'node_modules') continue;
+      await walkFiles(target, visit, state);
+      if (state.stop) return;
     } else if (entry.isFile()) {
-      files.push(target);
+      if (state.filesConsidered >= SEARCH_LIMITS.maxFiles) {
+        state.truncated = true;
+        state.stop = true;
+        return;
+      }
+      state.filesConsidered++;
+      await visit(target, state);
+      if (state.stop) return;
     }
   }
-
-  return files;
 }
 
 async function searchFiles(
   root: string,
   directory: string,
   query: string,
-): Promise<string[]> {
-  const matches: string[] = [];
+): Promise<{matches: string[]; truncated: boolean}> {
+  const state: SearchState = {
+    filesConsidered: 0,
+    bytesRead: 0,
+    matches: [],
+    truncated: false,
+    stop: false,
+  };
 
-  for (const file of await walkFiles(directory)) {
-    try {
-      const lines = (await readFile(file, 'utf8')).split('\n');
-      lines.forEach((line, index) => {
-        if (matches.length < 50 && line.includes(query)) {
-          const path = relative(root, file).split(sep).join('/');
-          matches.push(`${path}:${index + 1}:${line}`);
-        }
-      });
-    } catch {
-      // Ignore unreadable or non-text files in this learning harness.
+  await walkFiles(directory, async (file, searchState) => {
+    if (searchState.bytesRead >= SEARCH_LIMITS.maxTotalBytes) {
+      searchState.truncated = true;
+      searchState.stop = true;
+      return;
     }
-  }
 
-  return matches;
+    let handle;
+    try {
+      const metadata = await lstat(file);
+      if (!metadata.isFile() || metadata.size > SEARCH_LIMITS.maxFileBytes) {
+        if (metadata.size > SEARCH_LIMITS.maxFileBytes) searchState.truncated = true;
+        return;
+      }
+
+      handle = await open(file, 'r');
+      const current = await handle.stat();
+      if (!current.isFile() || current.size > SEARCH_LIMITS.maxFileBytes) {
+        if (current.size > SEARCH_LIMITS.maxFileBytes) searchState.truncated = true;
+        return;
+      }
+
+      const bytesAllowed = Math.min(
+        current.size,
+        SEARCH_LIMITS.maxFileBytes,
+        SEARCH_LIMITS.maxTotalBytes - searchState.bytesRead,
+      );
+      const decoder = new StringDecoder('utf8');
+      const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, bytesAllowed || 1));
+      let line = '';
+      let lineNumber = 1;
+      let fileBytesRead = 0;
+
+      while (fileBytesRead < bytesAllowed &&
+             searchState.matches.length < SEARCH_LIMITS.maxMatches &&
+             searchState.bytesRead < SEARCH_LIMITS.maxTotalBytes) {
+        const length = Math.min(
+          buffer.length,
+          bytesAllowed - fileBytesRead,
+        );
+        const {bytesRead} = await handle.read(buffer, 0, length, fileBytesRead);
+        if (bytesRead === 0) break;
+        fileBytesRead += bytesRead;
+        searchState.bytesRead += bytesRead;
+
+        line += decoder.write(buffer.subarray(0, bytesRead));
+        const completeLines = line.split('\n');
+        line = completeLines.pop() ?? '';
+        for (const completeLine of completeLines) {
+          if (completeLine.includes(query)) {
+            const path = relative(root, file).split(sep).join('/');
+            searchState.matches.push(
+              `${path}:${lineNumber}:${completeLine.slice(0, MAX_TEXT)}`,
+            );
+          }
+          lineNumber++;
+          if (searchState.matches.length >= SEARCH_LIMITS.maxMatches) break;
+        }
+      }
+
+      line += decoder.end();
+      if (searchState.matches.length < SEARCH_LIMITS.maxMatches && line.includes(query)) {
+        const path = relative(root, file).split(sep).join('/');
+        searchState.matches.push(
+          `${path}:${lineNumber}:${line.slice(0, MAX_TEXT)}`,
+        );
+      }
+
+      if (
+        searchState.matches.length >= SEARCH_LIMITS.maxMatches ||
+        bytesAllowed < current.size
+      ) {
+        searchState.truncated = true;
+        searchState.stop =
+          searchState.matches.length >= SEARCH_LIMITS.maxMatches ||
+          bytesAllowed < current.size;
+      }
+    } catch {
+      // Ignore files that disappear or become unreadable during the search.
+    } finally {
+      await handle?.close().catch(() => {});
+    }
+  }, state);
+
+  return {matches: state.matches, truncated: state.truncated};
 }
 
 const pathProperty = {
@@ -244,9 +353,9 @@ const searchDirectoryTool: ToolSpec = {
     const path = requiredString(args, 'path');
     const query = requiredString(args, 'query');
     const target = await boundedPath(context.workspaceRoot, path);
-    const matches = await searchFiles(context.workspaceRoot, target, query);
+    const result = await searchFiles(context.workspaceRoot, target, query);
 
-    return {matches, truncated: matches.length === 50};
+    return result;
   },
 };
 
