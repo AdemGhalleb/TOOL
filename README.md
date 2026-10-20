@@ -38,3 +38,29 @@ To compile and run the built project:
 npm run build
 npm start
 ```
+
+## Persisted sessions
+
+Conversation history is stored in `.agent-session.json`. The loader treats this
+file as untrusted input: it accepts only the message roles and function
+tool-call shapes used by the provider, rejects unknown message fields, and
+starts a fresh session with a warning if the file is malformed or invalid.
+Missing session files retain the normal first-run behavior.
+
+The limits are centralized in `SESSION_LIMITS` in
+[`src/session.ts`](./src/session.ts):
+
+- 5 MiB total file size
+- 1,000 messages
+- 100,000 characters per message content
+- 64 tool calls per assistant message
+- 1,000 characters per tool-call ID and tool name
+- 100,000 characters per tool-call argument string
+
+The file size is checked from metadata before its contents are read, and is
+checked again after reading to handle a file that grows during the operation.
+Saving validates the messages and writes a temporary file before replacing the
+session with a rename. A failed replacement leaves the existing session
+untouched. Rename replacement is atomic on platforms where the operating
+system supports replacing the destination atomically; the implementation does
+not claim stronger cross-platform guarantees.
