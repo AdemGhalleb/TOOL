@@ -282,6 +282,7 @@ async function searchFiles(
 const pathProperty = {
   type: 'string',
   description: 'Path relative to the workspace root. Use . for the root.',
+  minLength: 1,
 };
 
 const readFileTool: ToolSpec = {
@@ -349,6 +350,7 @@ const searchDirectoryTool: ToolSpec = {
           query: {
             type: 'string',
             description: 'Case-sensitive text to find.',
+            minLength: 1,
           },
         },
         required: ['path', 'query'],
@@ -411,7 +413,11 @@ const editFileTool: ToolSpec = {
         type: 'object',
         properties: {
           path: pathProperty,
-          old_text: {type: 'string', description: 'Exact text to replace once.'},
+          old_text: {
+            type: 'string',
+            description: 'Exact text to replace once.',
+            minLength: 1,
+          },
           new_text: {type: 'string', description: 'Replacement text.'},
         },
         required: ['path', 'old_text', 'new_text'],

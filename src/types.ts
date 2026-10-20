@@ -19,9 +19,16 @@ export type Message =
   | {role: 'tool'; tool_call_id: string; content: string};
 export interface ObjectSchema {
   type: 'object';
-  properties: Record<string, unknown>;
+  properties: Record<string, ToolPropertySchema>;
   required?: string[];
   additionalProperties?: boolean;
+}
+
+export interface ToolPropertySchema {
+  type: string;
+  description?: string;
+  minLength?: number;
+  maxLength?: number;
 }
 
 export interface ToolDefinition {

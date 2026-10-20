@@ -3,6 +3,7 @@ import {test} from 'node:test';
 import {
   AgentRunLimitError,
   runAgent,
+  validateToolArguments,
 } from '../src/agent.ts';
 import {ToolCancellationError} from '../src/types.ts';
 import type {AssistantMessage, ToolSpec} from '../src/types.ts';
@@ -36,6 +37,20 @@ function toolCall(content: string | null = null): AssistantMessage {
         id: 'call-1',
         type: 'function',
         function: {name: 'sample_tool', arguments: '{}'},
+      },
+    ],
+  };
+}
+
+function customToolCall(argumentsText: string, name = 'sample_tool'): AssistantMessage {
+  return {
+    role: 'assistant',
+    content: null,
+    tool_calls: [
+      {
+        id: 'call-1',
+        type: 'function',
+        function: {name, arguments: argumentsText},
       },
     ],
   };
@@ -165,6 +180,94 @@ test('tool errors remain tool results and the model can complete normally', asyn
   );
 
   assert.equal(result.answer, 'completed with the tool error');
+});
+
+test('runtime validation rejects malformed and non-object arguments', () => {
+  const definition = tool(() => Promise.resolve()).definition;
+
+  for (const value of [null, [], 'text', 42]) {
+    assert.throws(
+      () => validateToolArguments(definition, value),
+      /Tool arguments must be a JSON object/,
+    );
+  }
+});
+
+test('runtime validation rejects missing, mistyped, and unknown arguments', () => {
+  const definition = {
+    ...tool(() => Promise.resolve()).definition,
+    function: {
+      ...tool(() => Promise.resolve()).definition.function,
+      parameters: {
+        type: 'object' as const,
+        properties: {
+          path: {type: 'string' as const, minLength: 1},
+        },
+        required: ['path'],
+        additionalProperties: false,
+      },
+    },
+  };
+
+  assert.throws(
+    () => validateToolArguments(definition, {}),
+    /Missing required tool argument: path/,
+  );
+  assert.throws(
+    () => validateToolArguments(definition, {path: 7}),
+    /Tool argument path must be a string/,
+  );
+  assert.throws(
+    () => validateToolArguments(definition, {path: ''}),
+    /Tool argument path must not be empty/,
+  );
+  assert.throws(
+    () => validateToolArguments(definition, {path: 'ok', extra: true}),
+    /Unknown tool argument: extra/,
+  );
+});
+
+test('invalid tool calls become controlled tool errors without dispatch', async () => {
+  let executions = 0;
+  let modelCalls = 0;
+  const result = await runAgent(
+    'validate arguments',
+    context,
+    [],
+    [tool(async () => { executions += 1; return 'must not run'; })],
+    {
+      callModel: async messages => {
+        modelCalls += 1;
+        if (modelCalls === 1) return customToolCall('{');
+        const toolMessage = messages.find(message => message.role === 'tool');
+        assert.ok(toolMessage?.content.includes('JSON'));
+        return {role: 'assistant', content: 'recovered'};
+      },
+    },
+  );
+
+  assert.equal(result.answer, 'recovered');
+  assert.equal(executions, 0);
+});
+
+test('unknown tools are controlled errors and do not dispatch a fallback', async () => {
+  let modelCalls = 0;
+  const result = await runAgent(
+    'unknown tool',
+    context,
+    [],
+    [],
+    {
+      callModel: async messages => {
+        modelCalls += 1;
+        if (modelCalls === 1) return customToolCall('{}', 'not_a_tool');
+        assert.ok(messages.some(message => message.role === 'tool'));
+        return {role: 'assistant', content: 'recovered'};
+      },
+    },
+  );
+
+  assert.equal(result.answer, 'recovered');
 });
 
 test('a cancelled run cannot start a tool operation', async () => {

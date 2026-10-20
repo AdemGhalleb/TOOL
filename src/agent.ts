@@ -5,6 +5,7 @@ import type {
   Message,
   ToolCall,
   ToolContext,
+  ToolDefinition,
   ToolExecutionResult,
   ToolSpec,
 } from './types.ts';
@@ -36,6 +37,54 @@ export interface AgentRunOptions {
   signal?: AbortSignal;
 }
 
+export function validateToolArguments(
+  definition: ToolDefinition,
+  value: unknown,
+): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Tool arguments must be a JSON object.');
+  }
+
+  const argumentsObject = value as Record<string, unknown>;
+  const schema = definition.function.parameters;
+  for (const name of schema.required ?? []) {
+    if (!(name in argumentsObject)) {
+      throw new Error(`Missing required tool argument: ${name}.`);
+    }
+  }
+
+  for (const name of Object.keys(argumentsObject)) {
+    const property = schema.properties[name];
+    if (!property) {
+      if (schema.additionalProperties === false) {
+        throw new Error(`Unknown tool argument: ${name}.`);
+      }
+      continue;
+    }
+
+    const argument = argumentsObject[name];
+    if (property.type === 'string' && typeof argument !== 'string') {
+      throw new Error(`Tool argument ${name} must be a string.`);
+    }
+    if (
+      property.minLength !== undefined &&
+      typeof argument === 'string' &&
+      argument.length < property.minLength
+    ) {
+      throw new Error(`Tool argument ${name} must not be empty.`);
+    }
+    if (
+      property.maxLength !== undefined &&
+      typeof argument === 'string' &&
+      argument.length > property.maxLength
+    ) {
+      throw new Error(`Tool argument ${name} is too long.`);
+    }
+  }
+
+  return argumentsObject;
+}
+
 async function executeToolCalls(
   calls: ToolCall[],
   messages: Message[],
@@ -57,13 +106,14 @@ async function executeToolCalls(
       }
 
       const value: unknown = JSON.parse(call.function.arguments);
-      if (!value || typeof value !== 'object' || Array.isArray(value)) {
-        throw new Error('Tool arguments must decode to a JSON object.');
-      }
+      const validatedArguments = validateToolArguments(
+        tool.definition,
+        value,
+      );
 
       checkDeadline();
       const data = await tool.execute(
-        value as Record<string, unknown>,
+        validatedArguments,
         context,
       );
       result = {ok: true, data};

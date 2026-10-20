@@ -229,6 +229,28 @@ test('cancellation immediately after approval prevents a write', async () => {
   });
 });
 
+test('invalid write paths remain blocked by workspace confinement', async () => {
+  await withTempWorkspace(async workspaceRoot => {
+    assert.ok(writeTool);
+    let approvals = 0;
+    await assert.rejects(
+      writeTool.execute(
+        {path: '../outside.txt', content: 'must not save'},
+        {
+          workspaceRoot,
+          emit: () => {},
+          approve: async () => {
+            approvals++;
+            return true;
+          },
+        },
+      ),
+      /Path escapes the workspace/,
+    );
+    assert.equal(approvals, 0);
+  });
+});
+
 test('run_command executes with the sanitized environment and keeps its result shape', async () => {
   const secretKey = 'OPENROUTER_API_KEY';
   const appKey = 'AGENT_HARNESS_SENTINEL';
