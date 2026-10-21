@@ -64,3 +64,23 @@ session with a rename. A failed replacement leaves the existing session
 untouched. Rename replacement is atomic on platforms where the operating
 system supports replacing the destination atomically; the implementation does
 not claim stronger cross-platform guarantees.
+
+## Bounded model context
+
+Before each model request, the harness prepares a separate bounded context from
+the full in-memory/session history. The default total context budget is 8,192
+estimated tokens, with 1,024 tokens reserved for the model response, leaving
+7,168 estimated input tokens. A run can override the total and reserved values
+through `AgentRunOptions.contextBudget`, or provide `maxInputTokens` directly.
+
+The estimate is deliberately conservative and uses message character lengths
+(approximately four characters per token) plus fixed message overhead; it is
+not exact tokenizer accounting. System instructions and the latest request are
+always retained. Older complete exchanges are dropped first, while assistant
+tool calls remain grouped with all corresponding tool results. The persisted
+history is not modified. If the system instructions and latest request cannot
+fit, or the conversation contains an incomplete tool exchange, the model
+request fails with a controlled context-budget error.
+
+The harness does not currently summarize older history automatically, so
+semantic compression and provider-specific tokenizers remain follow-up work.

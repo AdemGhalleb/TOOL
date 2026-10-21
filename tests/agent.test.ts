@@ -6,7 +6,7 @@ import {
   validateToolArguments,
 } from '../src/agent.ts';
 import {ToolCancellationError} from '../src/types.ts';
-import type {AssistantMessage, ToolSpec} from '../src/types.ts';
+import type {AssistantMessage, Message, ToolSpec} from '../src/types.ts';
 
 const context = {
   workspaceRoot: process.cwd(),
@@ -66,6 +66,41 @@ test('runAgent returns a normal final answer before either limit', async () => {
   );
 
   assert.equal(result.answer, 'done');
+});
+
+test('repeated model requests receive bounded contexts without shrinking run history', async () => {
+  const requests: Message[][] = [];
+  let modelCalls = 0;
+  const initialMessages: Message[] = [
+    {role: 'system', content: 'instructions'},
+    {role: 'user', content: 'old '.repeat(100)},
+    {role: 'assistant', content: 'old answer'},
+  ];
+
+  const result = await runAgent(
+    'latest',
+    context,
+    initialMessages,
+    [tool(async () => 'ok')],
+    {
+      maxIterations: 2,
+      contextBudget: {maxInputTokens: 45},
+      callModel: async messages => {
+        requests.push(messages);
+        modelCalls++;
+        return modelCalls === 1
+          ? toolCall()
+          : {role: 'assistant', content: 'done'};
+      },
+    },
+  );
+
+  assert.equal(result.answer, 'done');
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].some(message => message.content === 'old '.repeat(100)), false);
+  assert.equal(requests[1].some(message => message.role === 'tool'), true);
+  assert.equal(initialMessages.length, 3);
+  assert.equal(result.messages.length, 7);
 });
 
 test('runAgent stops after the configured number of model iterations', async () => {

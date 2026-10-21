@@ -1,4 +1,5 @@
 import {callModel} from './openrouter.ts';
+import {prepareContext, type ContextBudget} from './context.ts';
 import {ToolCancellationError} from './types.ts';
 import type {
   AgentRunResult,
@@ -34,6 +35,7 @@ export interface AgentRunOptions {
   maxDurationMs?: number;
   now?: () => number;
   callModel?: typeof callModel;
+  contextBudget?: ContextBudget;
   signal?: AbortSignal;
 }
 
@@ -190,7 +192,7 @@ export async function runAgent(
       let assistant;
       try {
         assistant = await (options.callModel ?? callModel)(
-          messages,
+          prepareContext(messages, options.contextBudget),
           tools,
           controller.signal,
         );
