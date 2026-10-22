@@ -84,3 +84,23 @@ request fails with a controlled context-budget error.
 
 The harness does not currently summarize older history automatically, so
 semantic compression and provider-specific tokenizers remain follow-up work.
+
+## Agent run tracing
+
+Tracing is optional and is configured through `AgentRunOptions.trace`. The
+runtime emits typed, run-scoped events for run outcomes, model request
+lifecycles, context preparation, tool lifecycles, and approval decisions.
+`MemoryTraceSink` is provided for tests and bounded to 1,000 events by default;
+the default sink is a no-op. A custom sink can replace it without coupling the
+agent to a storage or observability provider.
+
+Events contain timestamps, a run ID, iteration numbers, tool names, safe outcome
+categories, context token estimates, reduction counts, approval decisions, and
+non-negative durations. They deliberately exclude prompts, assistant
+responses, tool arguments/results, file contents, environment variables,
+credentials, and raw exception messages. Tracing failures are ignored so they
+cannot change agent behavior.
+
+Traces are not persisted. There is no trace file, retention policy, cleanup
+job, or dashboard in this version. A future persistent sink must enforce
+bounded event sizes and retention separately from `.agent-session.json`.
