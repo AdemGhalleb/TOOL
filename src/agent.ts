@@ -1,5 +1,12 @@
 import {callModel} from './openrouter.ts';
-import {prepareContext, type ContextBudget} from './context.ts';
+import {ContextBudgetError, prepareContextWithMetadata, type ContextBudget} from './context.ts';
+import {
+  classifyError,
+  createRunId,
+  monotonicNow,
+  noopTraceSink,
+  type TraceSink,
+} from './tracing.ts';
 import {ToolCancellationError} from './types.ts';
 import type {
   AgentRunResult,
@@ -37,6 +44,8 @@ export interface AgentRunOptions {
   callModel?: typeof callModel;
   contextBudget?: ContextBudget;
   signal?: AbortSignal;
+  trace?: TraceSink;
+  runId?: string;
 }
 
 export function validateToolArguments(
@@ -87,12 +96,27 @@ export function validateToolArguments(
   return argumentsObject;
 }
 
+async function safeTrace(
+  sink: TraceSink,
+  event: Parameters<TraceSink['emit']>[0],
+): Promise<void> {
+  try {
+    await sink.emit(event);
+  } catch {
+    // Observability must never alter agent behavior.
+  }
+}
+
 async function executeToolCalls(
   calls: ToolCall[],
   messages: Message[],
   tools: ToolSpec[],
   context: ToolContext,
   checkDeadline: () => void,
+  trace: TraceSink,
+  runId: string,
+  iteration: number,
+  now: () => number,
 ): Promise<void> {
   const toolMap = new Map(
     tools.map(tool => [tool.definition.function.name, tool]),
@@ -100,6 +124,12 @@ async function executeToolCalls(
 
   for (const call of calls) {
     let result: ToolExecutionResult;
+    const toolName = call.function.name;
+    const toolStarted = now();
+    await safeTrace(trace, {
+      runId, type: 'tool.started', timestamp: new Date().toISOString(),
+      iteration, toolName,
+    });
 
     try {
       const tool = toolMap.get(call.function.name);
@@ -114,20 +144,52 @@ async function executeToolCalls(
       );
 
       checkDeadline();
+      const toolContext: ToolContext = {
+        ...context,
+        approve: async (action, signal) => {
+          await safeTrace(trace, {
+            runId, type: 'tool.approval.requested', timestamp: new Date().toISOString(),
+            iteration, toolName,
+          });
+          const approved = await context.approve(action, signal);
+          await safeTrace(trace, {
+            runId, type: 'tool.approval.resolved', timestamp: new Date().toISOString(),
+            iteration, toolName, approved,
+          });
+          return approved;
+        },
+      };
       const data = await tool.execute(
         validatedArguments,
-        context,
+        toolContext,
       );
       result = {ok: true, data};
     } catch (error) {
       if (error instanceof AgentRunLimitError) throw error;
       if (error instanceof ToolCancellationError) {
+        await safeTrace(trace, {
+          runId, type: 'tool.failed', timestamp: new Date().toISOString(),
+          iteration, toolName, durationMs: Math.max(0, now() - toolStarted),
+          outcome: 'cancelled',
+        });
         throw new AgentRunLimitError('deadline');
       }
+      await safeTrace(trace, {
+        runId, type: 'tool.failed', timestamp: new Date().toISOString(),
+        iteration, toolName, durationMs: Math.max(0, now() - toolStarted),
+        outcome: 'tool',
+      });
       result = {
         ok: false,
         error: error instanceof Error ? error.message : String(error),
       };
+    }
+
+    if (result.ok) {
+      await safeTrace(trace, {
+        runId, type: 'tool.completed', timestamp: new Date().toISOString(),
+        iteration, toolName, durationMs: Math.max(0, now() - toolStarted),
+      });
     }
 
     context.emit(
@@ -139,6 +201,7 @@ async function executeToolCalls(
       content: JSON.stringify(result),
     });
   }
+
 }
 
 const SYSTEM_PROMPT = `You are a small coding agent.
@@ -155,6 +218,13 @@ export async function runAgent(
   options: AgentRunOptions = {},
 ): Promise<AgentRunResult> {
   const now = options.now ?? Date.now;
+  const trace = options.trace ?? noopTraceSink;
+  const runId = options.runId ?? createRunId();
+  const startedAt = monotonicNow();
+  let terminalEmitted = false;
+  await safeTrace(trace, {
+    runId, type: 'run.started', timestamp: new Date().toISOString(),
+  });
   const deadline = now() + (options.maxDurationMs ?? MAX_AGENT_DURATION_MS);
   const maxIterations = options.maxIterations ?? MAX_AGENT_ITERATIONS;
   const controller = new AbortController();
@@ -189,19 +259,42 @@ export async function runAgent(
 
       iteration += 1;
       context.emit(`Model turn ${iteration}`);
+      const modelStarted = monotonicNow();
+      await safeTrace(trace, {
+        runId, type: 'model.request.started', timestamp: new Date().toISOString(),
+        iteration,
+      });
       let assistant;
       try {
+        const prepared = prepareContextWithMetadata(messages, options.contextBudget);
+        await safeTrace(trace, {
+          runId, type: 'context.prepared', timestamp: new Date().toISOString(),
+          iteration,
+          estimatedInputTokens: prepared.estimatedInputTokens,
+          selectedGroupCount: prepared.selectedGroupCount,
+          excludedGroupCount: prepared.excludedGroupCount,
+          excludedMessageCount: prepared.excludedMessageCount,
+        });
         assistant = await (options.callModel ?? callModel)(
-          prepareContext(messages, options.contextBudget),
+          prepared.messages,
           tools,
           controller.signal,
         );
       } catch (error) {
+        await safeTrace(trace, {
+          runId, type: 'model.request.failed', timestamp: new Date().toISOString(),
+          iteration, durationMs: Math.max(0, monotonicNow() - modelStarted),
+          outcome: error instanceof ContextBudgetError ? 'context_budget' : classifyError(error) === 'unknown' ? 'model' : classifyError(error),
+        });
         if (now() >= deadline || controller.signal.aborted) {
           throw new AgentRunLimitError('deadline');
         }
         throw error;
       }
+      await safeTrace(trace, {
+        runId, type: 'model.request.completed', timestamp: new Date().toISOString(),
+        iteration, durationMs: Math.max(0, monotonicNow() - modelStarted),
+      });
       checkDeadline();
       messages.push(assistant);
 
@@ -219,9 +312,43 @@ export async function runAgent(
         tools,
         runContext,
         checkDeadline,
+        trace,
+        runId,
+        iteration,
+        monotonicNow,
       );
     }
+  } catch (error) {
+    if (!terminalEmitted) {
+      terminalEmitted = true;
+      const category = classifyError(error);
+      const traceCategory =
+        category === 'deadline' &&
+        options.signal?.aborted &&
+        now() < deadline
+          ? 'cancelled'
+          : category === 'unknown'
+            ? 'model'
+            : category;
+      await safeTrace(trace, {
+        runId,
+        type: traceCategory === 'deadline' || traceCategory === 'cancelled'
+          ? 'run.cancelled'
+          : 'run.failed',
+        timestamp: new Date().toISOString(),
+        durationMs: Math.max(0, monotonicNow() - startedAt),
+        outcome: traceCategory,
+      });
+    }
+    throw error;
   } finally {
+    if (!terminalEmitted) {
+      terminalEmitted = true;
+      await safeTrace(trace, {
+        runId, type: 'run.completed', timestamp: new Date().toISOString(),
+        durationMs: Math.max(0, monotonicNow() - startedAt),
+      });
+    }
     clearTimeout(deadlineTimer);
     options.signal?.removeEventListener('abort', cancelRun);
   }
