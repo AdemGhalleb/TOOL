@@ -27,6 +27,14 @@ interface ConversationGroup {
   estimatedTokens: number;
 }
 
+export interface PreparedContext {
+  messages: Message[];
+  estimatedInputTokens: number;
+  selectedGroupCount: number;
+  excludedGroupCount: number;
+  excludedMessageCount: number;
+}
+
 function estimateMessageTokens(message: Message): number {
   const contentLength = typeof message.content === 'string'
     ? message.content.length
@@ -143,6 +151,13 @@ export function prepareContext(
   messages: Message[],
   budget: ContextBudget = {},
 ): Message[] {
+  return prepareContextWithMetadata(messages, budget).messages;
+}
+
+export function prepareContextWithMetadata(
+  messages: Message[],
+  budget: ContextBudget = {},
+): PreparedContext {
   const maxInputTokens = getBudget(budget);
   const systemMessages = messages.filter(message => message.role === 'system');
   const groups = groupConversation(messages);
@@ -152,7 +167,13 @@ export function prepareContext(
     if (systemTokens > maxInputTokens) {
       throw new ContextBudgetError('System instructions exceed the configured context budget.');
     }
-    return [...systemMessages];
+    return {
+      messages: [...systemMessages],
+      estimatedInputTokens: systemTokens,
+      selectedGroupCount: 0,
+      excludedGroupCount: 0,
+      excludedMessageCount: 0,
+    };
   }
 
   const selected = [latestGroup];
@@ -171,8 +192,17 @@ export function prepareContext(
     usedTokens += group.estimatedTokens;
   }
 
-  return [
+  const prepared = [
     ...systemMessages,
     ...selected.flatMap(group => group.messages),
   ];
+  return {
+    messages: prepared,
+    estimatedInputTokens: usedTokens,
+    selectedGroupCount: selected.length,
+    excludedGroupCount: groups.length - selected.length,
+    excludedMessageCount: groups
+      .filter(group => !selected.includes(group))
+      .reduce((total, group) => total + group.messages.length, 0),
+  };
 }
