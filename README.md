@@ -104,3 +104,25 @@ cannot change agent behavior.
 Traces are not persisted. There is no trace file, retention policy, cleanup
 job, or dashboard in this version. A future persistent sink must enforce
 bounded event sizes and retention separately from `.agent-session.json`.
+
+## Deterministic evaluations
+
+Run the cross-component runtime evaluations with:
+
+```sh
+npm run eval
+```
+
+The suite uses mocked model callbacks, controlled tools, fake clocks,
+temporary session files, and the in-memory trace sink. It covers successful
+tool protocol exchanges, invalid tool calls, approval and cancellation safety,
+execution failures and limits, bounded context handling, session recovery,
+trace integrity, and trace-sink isolation. Each scenario reports its own
+pass/fail result and expected outcome; the command exits nonzero if any
+scenario fails.
+
+To add a scenario, add a named entry to `tests/evaluation.ts` using injected
+`runAgent` dependencies and explicit assertions. A passing scenario means the
+runtime behavior matched those assertions. These evaluations measure
+deterministic runtime behavior under controlled responses, not model
+intelligence, real-world task success, or network/API reliability.
