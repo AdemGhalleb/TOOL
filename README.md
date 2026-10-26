@@ -126,3 +126,23 @@ To add a scenario, add a named entry to `tests/evaluation.ts` using injected
 runtime behavior matched those assertions. These evaluations measure
 deterministic runtime behavior under controlled responses, not model
 intelligence, real-world task success, or network/API reliability.
+
+The evaluations are also run in GitHub Actions on pushes and pull requests.
+They require no API keys, paid model providers, or external services. Use
+`--json` when another tool needs a machine-readable report:
+
+```sh
+npm run eval -- --json
+```
+
+The JSON report contains `summary` (`total`, `passed`, `failed`, and a
+zero-safe `passRate`) and one `scenarios` entry per evaluation. Each entry has
+an `id`, readable `name`, `status` (`passed` or `failed`), expected and actual
+outcomes, and failure details. JSON is written only to stdout; runner
+diagnostics go to stderr. The command exits with code 0 only when every
+scenario passes. When capturing stdout for a strict JSON-only pipeline, use
+the package manager's silent mode to suppress npm's lifecycle banner:
+
+```sh
+npm run --silent eval -- --json
+```
