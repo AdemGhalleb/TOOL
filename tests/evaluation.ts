@@ -7,6 +7,7 @@ import {
 } from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {pathToFileURL} from 'node:url';
 import {AgentRunLimitError, runAgent} from '../src/agent.ts';
 import {ContextBudgetError} from '../src/context.ts';
 import {loadSession, SESSION_LIMITS, validateSessionData} from '../src/session.ts';
@@ -18,13 +19,37 @@ import type {
   ToolSpec,
 } from '../src/types.ts';
 
-interface EvaluationResult {
+export interface EvaluationResult {
   id: string;
   name: string;
   passed: boolean;
   expectedOutcome: string;
   actualOutcome: string;
   failures: string[];
+}
+
+export interface EvaluationReport {
+  summary: {
+    total: number;
+    passed: number;
+    failed: number;
+    passRate: number;
+  };
+  scenarios: Array<{
+    id: string;
+    name: string;
+    status: 'passed' | 'failed';
+    expected: string;
+    actual: string;
+    failures: string[];
+  }>;
+  error: string | null;
+}
+
+export interface EvaluationCliOptions {
+  run?: () => Promise<EvaluationResult[]>;
+  stdout?: (text: string) => void;
+  stderr?: (text: string) => void;
 }
 
 interface Scenario {
@@ -520,22 +545,86 @@ export async function runEvaluations(): Promise<EvaluationResult[]> {
   return results;
 }
 
-const results = await runEvaluations();
-const passed = results.filter(result => result.passed).length;
-const failed = results.length - passed;
-const summary = {
-  total: results.length,
-  passed,
-  failed,
-  passRate: results.length === 0 ? 0 : passed / results.length,
-};
+export function createEvaluationReport(
+  results: EvaluationResult[],
+  error: string | null = null,
+): EvaluationReport {
+  const passed = results.filter(result => result.passed).length;
+  const failed = results.length - passed;
+  return {
+    summary: {
+      total: results.length,
+      passed,
+      failed,
+      passRate: results.length === 0 ? 0 : passed / results.length,
+    },
+    scenarios: results.map(result => ({
+      id: result.id,
+      name: result.name,
+      status: result.passed ? 'passed' : 'failed',
+      expected: result.expectedOutcome,
+      actual: result.actualOutcome,
+      failures: result.failures,
+    })),
+    error,
+  };
+}
 
-for (const result of results) {
-  console.log(`${result.passed ? 'PASS' : 'FAIL'} ${result.id}: ${result.name}`);
-  if (!result.passed) {
-    for (const failure of result.failures) console.log(`  ${failure}`);
+export function parseEvaluationArgs(args: string[]): {json: boolean} {
+  const unsupported = args.find(arg => arg !== '--json');
+  if (unsupported) {
+    throw new Error(`Unsupported option: ${unsupported}`);
+  }
+  return {json: args.includes('--json')};
+}
+
+function formatHumanReadable(report: EvaluationReport): string {
+  const lines: string[] = [];
+  for (const result of report.scenarios) {
+    lines.push(`${result.status === 'passed' ? 'PASS' : 'FAIL'} ${result.id}: ${result.name}`);
+    if (result.status === 'failed') {
+      for (const failure of result.failures) lines.push(`  ${failure}`);
+    }
+  }
+  lines.push(
+    `Summary: ${report.summary.passed}/${report.summary.total} passed ` +
+    `(${(report.summary.passRate * 100).toFixed(1)}%)`,
+  );
+  return `${lines.join('\n')}\n`;
+}
+
+export async function runEvaluationCli(
+  args: string[] = process.argv.slice(2),
+  options: EvaluationCliOptions = {},
+): Promise<number> {
+  const stdout = options.stdout ?? (text => process.stdout.write(text));
+  const stderr = options.stderr ?? (text => process.stderr.write(text));
+  let parsedArgs: {json: boolean};
+  try {
+    parsedArgs = parseEvaluationArgs(args);
+  } catch (error) {
+    stderr(`${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+
+  try {
+    const results = await (options.run ?? runEvaluations)();
+    const report = createEvaluationReport(results);
+    stdout(parsedArgs.json
+      ? `${JSON.stringify(report)}\n`
+      : formatHumanReadable(report));
+    return report.summary.failed > 0 ? 1 : 0;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    stderr(`${message}\n`);
+    if (parsedArgs.json) {
+      stdout(`${JSON.stringify(createEvaluationReport([], message))}\n`);
+    }
+    return 1;
   }
 }
-console.log(`Summary: ${summary.passed}/${summary.total} passed (${(summary.passRate * 100).toFixed(1)}%)`);
 
-if (failed > 0) process.exitCode = 1;
+if (process.argv[1] &&
+    import.meta.url === pathToFileURL(process.argv[1]).href) {
+  process.exitCode = await runEvaluationCli();
+}
