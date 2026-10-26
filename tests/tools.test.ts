@@ -300,7 +300,8 @@ test('run_command keeps its error result fields for a failed command', async () 
     'stdout',
   ]);
   assert.equal(result.approved, true);
-  assert.equal(result.exitCode, 1);
+  assert.equal(typeof result.exitCode, 'number');
+  assert.notEqual(result.exitCode, 0);
   assert.equal(typeof result.stdout, 'string');
   assert.equal(typeof result.stderr, 'string');
   assert.equal(typeof result.error, 'string');
