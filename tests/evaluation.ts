@@ -312,10 +312,40 @@ const scenarios: Scenario[] = [
       );
 
       await assert.rejects(cancelledRun, (error: unknown) =>
-        error instanceof AgentRunLimitError && error.limit === 'deadline');
+        error instanceof AgentRunLimitError && error.limit === 'cancelled');
       assert.equal(sideEffects, 1);
       assert.equal(deniedCalls, 0);
       assert.equal(cancellationSideEffects, 0);
+    },
+  ),
+  scenario(
+    'active-tool-cancellation',
+    'Cancellation stops an executing tool without successful completion',
+    'the active tool records cancellation, no later tool or model request starts, and the run is cancelled once',
+    async () => {
+      const controller = new AbortController();
+      const sink = new MemoryTraceSink();
+      let modelCalls = 0;
+      let laterToolCalls = 0;
+      await assert.rejects(runAgent('cancel active tool', context, [], [
+        tool(async (_args, toolContext) => new Promise((_resolve, reject) => {
+          toolContext.signal?.addEventListener('abort', () => reject(new ToolCancellationError()), {once: true});
+          queueMicrotask(() => controller.abort());
+        })),
+        {...tool(async () => { laterToolCalls++; return 'unexpected'; }), definition: {
+          type: 'function',
+          function: {name: 'later_tool', description: 'later', parameters: {type: 'object', properties: {}}},
+        }},
+      ], {
+        signal: controller.signal,
+        trace: sink,
+        callModel: async () => { modelCalls++; return toolCall(); },
+      }), error => error instanceof AgentRunLimitError && error.limit === 'cancelled');
+      assert.equal(modelCalls, 1);
+      assert.equal(laterToolCalls, 0);
+      assert.equal(sink.events.filter(event => event.type === 'tool.failed' && event.outcome === 'cancelled').length, 1);
+      assert.equal(sink.events.some(event => event.type === 'tool.completed'), false);
+      assert.deepEqual(terminalEvents(sink), ['run.cancelled']);
     },
   ),
   scenario(

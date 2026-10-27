@@ -97,7 +97,8 @@ export function classifyError(error: unknown): TraceErrorCategory {
     if (name === 'ContextBudgetError') return 'context_budget';
     if (name === 'AgentRunLimitError') {
       const limit = (error as {limit?: unknown}).limit;
-      return limit === 'iterations' ? 'iteration_limit' : 'deadline';
+      if (limit === 'iterations') return 'iteration_limit';
+      return limit === 'cancelled' ? 'cancelled' : 'deadline';
     }
     if (name === 'ToolCancellationError') return 'cancelled';
   }

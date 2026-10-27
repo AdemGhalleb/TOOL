@@ -1,4 +1,4 @@
-import {exec} from 'node:child_process';
+import {spawn, type ChildProcess} from 'node:child_process';
 import {
   open,
   lstat,
@@ -10,11 +10,15 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import {StringDecoder} from 'node:string_decoder';
-import {dirname, isAbsolute, relative, resolve, sep} from 'node:path';
+import {dirname, isAbsolute, join, relative, resolve, sep} from 'node:path';
 import {ToolCancellationError} from './types.ts';
 import type {ToolSpec} from './types.ts';
 
 const MAX_TEXT = 12_000;
+export const COMMAND_TERMINATION_GRACE_MS = 500;
+const COMMAND_TIMEOUT_MS = 10_000;
+const COMMAND_CLOSE_TIMEOUT_MS = 5_000;
+const COMMAND_MAX_BUFFER = 1_000_000;
 
 export const SEARCH_LIMITS = {
   maxFiles: 1_000,
@@ -41,6 +45,125 @@ function assertActive(context: {signal?: AbortSignal}): void {
   if (context.signal?.aborted) {
     throw new ToolCancellationError();
   }
+}
+
+function appendBounded(chunks: Buffer[], chunk: Buffer, total: {value: number}): boolean {
+  const remaining = COMMAND_MAX_BUFFER - total.value;
+  if (remaining > 0) chunks.push(chunk.subarray(0, remaining));
+  total.value += chunk.length;
+  return total.value > COMMAND_MAX_BUFFER;
+}
+
+function invokeTaskkill(pid: number, force: boolean): void {
+  const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT;
+  const executable = systemRoot
+    ? join(systemRoot, 'System32', 'taskkill.exe')
+    : 'taskkill.exe';
+  const killer = spawn(executable, ['/PID', String(pid), '/T', ...(force ? ['/F'] : [])], {
+    stdio: 'ignore', windowsHide: true,
+  });
+  const fallback = () => {
+    // Keep the direct child stoppable if taskkill is unavailable or denies access.
+    // This cannot guarantee termination of descendants, which is documented below.
+    try { process.kill(pid, force ? 'SIGKILL' : 'SIGTERM'); } catch {}
+  };
+  killer.on('error', fallback);
+  killer.once('exit', code => { if (code !== 0) fallback(); });
+}
+
+export function executeCommand(
+  command: string,
+  options: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    signal?: AbortSignal;
+    onSpawn?: () => void;
+    onClose?: () => void;
+  },
+): Promise<{exitCode: number; stdout: string; stderr: string; error: string | null}> {
+  assertActive(options);
+  return new Promise((resolveCommand, rejectCommand) => {
+    let child: ChildProcess;
+    try {
+      child = spawn(command, [], {
+        cwd: options.cwd, env: options.env, shell: true, windowsHide: true,
+        detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (error) { rejectCommand(error); return; }
+
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    const stdoutSize = {value: 0};
+    const stderrSize = {value: 0};
+    let spawnError: Error | null = null;
+    let stopReason: 'cancelled' | 'timeout' | 'maxBuffer' | null = null;
+    let escalation: NodeJS.Timeout | undefined;
+    let timeout: NodeJS.Timeout | undefined;
+    let closeTimeout: NodeJS.Timeout | undefined;
+    let closed = false;
+    const sendSignal = (force: boolean): void => {
+      if (process.platform === 'win32') {
+        if (child.pid) invokeTaskkill(child.pid, force);
+        else child.kill(force ? 'SIGKILL' : 'SIGTERM');
+      } else {
+        try {
+          if (child.pid) process.kill(-child.pid, force ? 'SIGKILL' : 'SIGTERM');
+          else child.kill(force ? 'SIGKILL' : 'SIGTERM');
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ESRCH') return;
+          child.kill(force ? 'SIGKILL' : 'SIGTERM');
+        }
+      }
+    };
+    const beginStop = (reason: typeof stopReason): void => {
+      if (closed || stopReason) return;
+      stopReason = reason;
+      sendSignal(false);
+      escalation = setTimeout(() => sendSignal(true), COMMAND_TERMINATION_GRACE_MS);
+      closeTimeout = setTimeout(() => {
+        if (closed) return;
+        cleanup();
+        rejectCommand(new Error('Could not confirm command process closure after termination.'));
+      }, COMMAND_CLOSE_TIMEOUT_MS);
+    };
+    const onAbort = () => beginStop('cancelled');
+    const cleanup = () => {
+      clearTimeout(timeout);
+      clearTimeout(escalation);
+      clearTimeout(closeTimeout);
+      options.signal?.removeEventListener('abort', onAbort);
+    };
+    child.stdout?.on('data', (chunk: Buffer | string) => {
+      if (appendBounded(stdout, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk), stdoutSize)) beginStop('maxBuffer');
+    });
+    child.stderr?.on('data', (chunk: Buffer | string) => {
+      if (appendBounded(stderr, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk), stderrSize)) beginStop('maxBuffer');
+    });
+    child.on('error', error => { spawnError = error; });
+    child.once('spawn', () => {
+      options.onSpawn?.();
+      // An abort can race with asynchronous process creation before a PID exists.
+      if (stopReason) sendSignal(false);
+    });
+    child.once('close', (code, signal) => {
+      closed = true;
+      options.onClose?.();
+      cleanup();
+      if (stopReason === 'cancelled') {
+        rejectCommand(new ToolCancellationError());
+        return;
+      }
+      const stdoutText = Buffer.concat(stdout).toString('utf8').slice(0, MAX_TEXT);
+      const stderrText = Buffer.concat(stderr).toString('utf8').slice(0, MAX_TEXT);
+      const error = stopReason === 'timeout' ? 'Command timed out.'
+        : stopReason === 'maxBuffer' ? 'Command output exceeded the maximum buffer.'
+          : spawnError?.message ?? (code === 0 ? null : `Command exited ${signal ? `from ${signal}` : `with code ${code ?? 1}`}.`);
+      resolveCommand({exitCode: code ?? 1, stdout: stdoutText, stderr: stderrText, error});
+    });
+    options.signal?.addEventListener('abort', onAbort, {once: true});
+    if (options.signal?.aborted) onAbort();
+    timeout = setTimeout(() => beginStop('timeout'), COMMAND_TIMEOUT_MS);
+  });
 }
 
 export function buildCommandEnvironment(
@@ -183,6 +306,7 @@ async function searchFiles(
   root: string,
   directory: string,
   query: string,
+  signal?: AbortSignal,
 ): Promise<{matches: string[]; truncated: boolean}> {
   const state: SearchState = {
     filesConsidered: 0,
@@ -193,6 +317,7 @@ async function searchFiles(
   };
 
   await walkFiles(directory, async (file, searchState) => {
+    if (signal?.aborted) throw new ToolCancellationError();
     if (searchState.bytesRead >= SEARCH_LIMITS.maxTotalBytes) {
       searchState.truncated = true;
       searchState.stop = true;
@@ -228,6 +353,7 @@ async function searchFiles(
       while (fileBytesRead < bytesAllowed &&
              searchState.matches.length < SEARCH_LIMITS.maxMatches &&
              searchState.bytesRead < SEARCH_LIMITS.maxTotalBytes) {
+        if (signal?.aborted) throw new ToolCancellationError();
         const length = Math.min(
           buffer.length,
           bytesAllowed - fileBytesRead,
@@ -269,7 +395,8 @@ async function searchFiles(
           searchState.matches.length >= SEARCH_LIMITS.maxMatches ||
           bytesAllowed < current.size;
       }
-    } catch {
+    } catch (error) {
+      if (error instanceof ToolCancellationError) throw error;
       // Ignore files that disappear or become unreadable during the search.
     } finally {
       await handle?.close().catch(() => {});
@@ -301,7 +428,9 @@ const readFileTool: ToolSpec = {
   },
   async execute(args, context) {
     const path = requiredString(args, 'path');
+    assertActive(context);
     const target = await boundedPath(context.workspaceRoot, path);
+    assertActive(context);
     const content = await readFile(target, 'utf8');
 
     return {
@@ -328,7 +457,9 @@ const listFilesTool: ToolSpec = {
   },
   async execute(args, context) {
     const path = requiredString(args, 'path');
+    assertActive(context);
     const target = await boundedPath(context.workspaceRoot, path);
+    assertActive(context);
     const entries = await readdir(target, {withFileTypes: true});
 
     return entries
@@ -361,8 +492,11 @@ const searchDirectoryTool: ToolSpec = {
   async execute(args, context) {
     const path = requiredString(args, 'path');
     const query = requiredString(args, 'query');
+    assertActive(context);
     const target = await boundedPath(context.workspaceRoot, path);
-    const result = await searchFiles(context.workspaceRoot, target, query);
+    assertActive(context);
+    const result = await searchFiles(context.workspaceRoot, target, query, context.signal);
+    assertActive(context);
 
     return result;
   },
@@ -398,6 +532,7 @@ const writeFileTool: ToolSpec = {
 
     // Apply only an approved workspace mutation.
     await mkdir(dirname(target), {recursive: true});
+    assertActive(context);
     await writeFile(target, content, 'utf8');
     return {approved: true, path};
   },
@@ -497,12 +632,12 @@ const runCommandTool: ToolSpec = {
     assertActive(context);
 
     // Capture bounded command output from the canonical workspace.
-    return await new Promise<unknown>(done => {
-      exec(command, {cwd: context.workspaceRoot, encoding: 'utf8', timeout: 10_000, maxBuffer: 1_000_000, env: buildCommandEnvironment()}, (error, stdout, stderr) => {
-        const exitCode = error && typeof error.code === 'number' ? error.code : error ? 1 : 0;
-        done({approved: true, exitCode, stdout: String(stdout).slice(0, MAX_TEXT), stderr: String(stderr).slice(0, MAX_TEXT), error: error?.message ?? null});
-      });
+    const result = await executeCommand(command, {
+      cwd: context.workspaceRoot,
+      env: buildCommandEnvironment(),
+      signal: context.signal,
     });
+    return {approved: true, ...result};
   },
 };
 

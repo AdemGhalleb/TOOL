@@ -101,6 +101,33 @@ responses, tool arguments/results, file contents, environment variables,
 credentials, and raw exception messages. Tracing failures are ignored so they
 cannot change agent behavior.
 
+### Cancellation and running commands
+
+User cancellation and the run deadline abort the shared tool signal. A user
+cancellation is reported as `AgentRunLimitError` with `limit: 'cancelled'`; a
+deadline retains `limit: 'deadline'`. A tool waiting for approval or already
+executing receives that signal, and the run does not start another tool or
+model request afterward. A cancelled tool is traced as failed with the
+`cancelled` outcome, never as completed.
+
+Approved shell commands receive a graceful stop request first and a forced stop
+after 500 ms. Unix-like systems run commands in a separate process group and
+signal that group. Windows uses `taskkill.exe` with `/T` and then `/F` to stop
+the command tree, with a direct-child fallback if `taskkill` cannot be used.
+Windows process-tree cleanup is best effort because Node does not expose Job
+Objects directly and the system utility may be unavailable or denied. The
+command tool waits for the child's `close` event before reporting cancellation;
+if closure cannot be confirmed within five seconds after termination starts, it
+returns a cleanup failure instead of claiming the process exited. Captured
+output remains bounded, command environments remain allowlisted, and the
+existing ten-second command timeout is preserved.
+
+Filesystem reads and searches stop at cancellation boundaries; an in-flight
+filesystem request cannot always be interrupted. Approved writes and deletes
+check cancellation before beginning their mutation. If cancellation races with
+an already-started filesystem or shell side effect, the harness does not roll
+that effect back; cancellation describes the run outcome, not a transaction.
+
 Traces are not persisted. There is no trace file, retention policy, cleanup
 job, or dashboard in this version. A future persistent sink must enforce
 bounded event sizes and retention separately from `.agent-session.json`.

@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import {mkdtemp, mkdir, readFile, rm, symlink, writeFile} from 'node:fs/promises';
+import {mkdtemp, mkdir, readFile, rm, symlink, watch, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {test} from 'node:test';
-import {buildCommandEnvironment, SEARCH_LIMITS, tools} from '../src/tools.ts';
+import {buildCommandEnvironment, executeCommand, SEARCH_LIMITS, tools} from '../src/tools.ts';
 import {ToolCancellationError} from '../src/types.ts';
 
 const searchTool = tools.find(
@@ -164,12 +164,20 @@ test('search_directory ignores excluded directories', async () => {
   });
 });
 
-test('search_directory does not follow directory symlinks', async () => {
+test('search_directory does not follow directory symlinks', async t => {
   await withTempWorkspace(async workspaceRoot => {
     const outside = await mkdtemp(join(tmpdir(), 'agent-harness-outside-'));
     try {
       await writeFile(join(outside, 'outside.txt'), 'needle');
-      await symlink(outside, join(workspaceRoot, 'linked'), 'junction');
+      try {
+        await symlink(outside, join(workspaceRoot, 'linked'), 'junction');
+      } catch (error) {
+        if (process.platform === 'win32' && (error as NodeJS.ErrnoException).code === 'EPERM') {
+          t.skip('Windows symlink creation is not permitted by this environment.');
+          return;
+        }
+        throw error;
+      }
 
       assert.deepEqual(await search(workspaceRoot, 'needle'), {
         matches: [],
@@ -304,5 +312,101 @@ test('run_command keeps its error result fields for a failed command', async () 
   assert.notEqual(result.exitCode, 0);
   assert.equal(typeof result.stdout, 'string');
   assert.equal(typeof result.stderr, 'string');
+  assert.equal(typeof result.error, 'string');
+});
+
+test('executeCommand observes normal process completion and bounded output', async () => {
+  const result = await executeCommand('node -e "process.stdout.write(\'finished\')"', {
+    cwd: process.cwd(), env: buildCommandEnvironment(),
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, 'finished');
+  assert.equal(result.error, null);
+});
+
+test('a natural close that wins the abort race remains a normal completion', async () => {
+  const controller = new AbortController();
+  const result = await executeCommand('node -e "process.stdout.write(\'done\')"', {
+    cwd: process.cwd(), env: buildCommandEnvironment(), signal: controller.signal,
+    onClose: () => controller.abort(),
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, 'done');
+});
+
+test('executeCommand rejects an already aborted signal before launching a process', async () => {
+  await withTempWorkspace(async workspaceRoot => {
+    const controller = new AbortController();
+    controller.abort();
+    assert.throws(() => executeCommand(
+      'node -e "require(\'fs\').writeFileSync(\'launched\', \'yes\')"',
+      {cwd: workspaceRoot, env: buildCommandEnvironment(), signal: controller.signal},
+    ), ToolCancellationError);
+    await assert.rejects(readFile(join(workspaceRoot, 'launched'), 'utf8'));
+  });
+});
+
+test('executeCommand cancels a live process and waits for its close event', async () => {
+  const controller = new AbortController();
+  let announceSpawn!: () => void;
+  const spawned = new Promise<void>(resolveSpawn => { announceSpawn = resolveSpawn; });
+  const lifetime = process.platform === 'win32' ? 'setTimeout(()=>process.exit(0),1500)' : 'setInterval(()=>{},1000)';
+  const run = executeCommand(`node -e "${lifetime}"`, {
+    cwd: process.cwd(), env: buildCommandEnvironment(), signal: controller.signal,
+    onSpawn: announceSpawn,
+  });
+  try {
+    await spawned;
+    controller.abort();
+    await assert.rejects(run, ToolCancellationError);
+  } finally {
+    if (!controller.signal.aborted) controller.abort();
+    await run.catch(() => {});
+  }
+});
+
+test('Unix cancellation terminates a child process in the command process group', async t => {
+  if (process.platform === 'win32') {
+    t.skip('Unix process-group integration check.');
+    return;
+  }
+  await withTempWorkspace(async workspaceRoot => {
+    const controller = new AbortController();
+    const watcher = watch(workspaceRoot);
+    let run: Promise<unknown> | undefined;
+    try {
+      const childPidReady = (async () => {
+        for await (const event of watcher) {
+          if (event.filename === 'child.pid') {
+            return Number(await readFile(join(workspaceRoot, 'child.pid'), 'utf8'));
+          }
+        }
+        throw new Error('The child process did not start.');
+      })();
+      const script = "const {spawn}=require('node:child_process');const fs=require('node:fs');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});fs.writeFileSync('child.pid',String(child.pid));setInterval(()=>{},1000)";
+      run = executeCommand(`node -e "${script}"`, {
+        cwd: workspaceRoot, env: buildCommandEnvironment(), signal: controller.signal,
+      });
+      const childPid = await Promise.race([
+        childPidReady,
+        new Promise<number>((_, reject) => setTimeout(() => reject(new Error('Child process startup timed out.')), 5_000)),
+      ]);
+      controller.abort();
+      await assert.rejects(run, ToolCancellationError);
+      assert.throws(() => process.kill(childPid, 0), {code: 'ESRCH'});
+    } finally {
+      watcher.close();
+      if (!controller.signal.aborted) controller.abort();
+      await run?.catch(() => {});
+    }
+  });
+});
+
+test('executeCommand reports spawn failures in the command result', async () => {
+  const result = await executeCommand('node -e ""', {
+    cwd: join(tmpdir(), 'missing-agent-harness-directory'),
+    env: buildCommandEnvironment(),
+  });
+  assert.notEqual(result.exitCode, 0);
   assert.equal(typeof result.error, 'string');
 });

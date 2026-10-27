@@ -22,6 +22,7 @@ type PendingApproval = {
   resolve: (approved: boolean) => void;
   reject: (error: unknown) => void;
   settled: boolean;
+  cleanup: () => void;
 };
 
 type AppProps = {
@@ -62,6 +63,7 @@ function App({respond}: AppProps) {
     const approved = /^y(es)?$/i.test(message);
     setInput('');
     setApproval(null);
+    pending.cleanup();
     append({
       role: 'approval',
       text: `${approved ? 'Approved' : 'Denied'}: ${pending.action}`,
@@ -99,10 +101,12 @@ function App({respond}: AppProps) {
             resolve: resolveApproval,
             reject: rejectApproval,
             settled: false,
+            cleanup: () => {},
           };
           const cancel = () => {
             if (pending.settled) return;
             pending.settled = true;
+            pending.cleanup();
             setApproval(current => current === pending ? null : current);
             pending.reject(new ToolCancellationError());
           };
@@ -110,6 +114,7 @@ function App({respond}: AppProps) {
             cancel();
             return;
           }
+          pending.cleanup = () => signal?.removeEventListener('abort', cancel);
           signal?.addEventListener('abort', cancel, {once: true});
           setApproval(pending);
         });

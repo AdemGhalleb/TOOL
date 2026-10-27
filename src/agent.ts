@@ -25,13 +25,15 @@ export const MAX_AGENT_DURATION_MS = 120_000;
 
 export class AgentRunLimitError extends Error {
   constructor(
-    readonly limit: 'iterations' | 'deadline',
+    readonly limit: 'iterations' | 'deadline' | 'cancelled',
     maxIterations = MAX_AGENT_ITERATIONS,
   ) {
     super(
       limit === 'iterations'
         ? `Agent stopped after ${maxIterations} model iterations.`
-        : 'Agent stopped because its execution deadline expired.',
+        : limit === 'cancelled'
+          ? 'Agent run was cancelled.'
+          : 'Agent stopped because its execution deadline expired.',
     );
     this.name = 'AgentRunLimitError';
   }
@@ -112,7 +114,7 @@ async function executeToolCalls(
   messages: Message[],
   tools: ToolSpec[],
   context: ToolContext,
-  checkDeadline: () => void,
+  checkActive: () => void,
   trace: TraceSink,
   runId: string,
   iteration: number,
@@ -123,6 +125,7 @@ async function executeToolCalls(
   );
 
   for (const call of calls) {
+    checkActive();
     let result: ToolExecutionResult;
     const toolName = call.function.name;
     const toolStarted = now();
@@ -143,7 +146,7 @@ async function executeToolCalls(
         value,
       );
 
-      checkDeadline();
+      checkActive();
       const toolContext: ToolContext = {
         ...context,
         approve: async (action, signal) => {
@@ -163,16 +166,28 @@ async function executeToolCalls(
         validatedArguments,
         toolContext,
       );
+      checkActive();
       result = {ok: true, data};
     } catch (error) {
-      if (error instanceof AgentRunLimitError) throw error;
+      if (error instanceof AgentRunLimitError) {
+        if (error.limit !== 'iterations') {
+          await safeTrace(trace, {
+            runId, type: 'tool.failed', timestamp: new Date().toISOString(),
+            iteration, toolName, durationMs: Math.max(0, now() - toolStarted),
+            outcome: error.limit === 'deadline' ? 'deadline' : 'cancelled',
+          });
+        }
+        throw error;
+      }
       if (error instanceof ToolCancellationError) {
+        const outcome = context.signal?.reason === 'deadline' ? 'deadline' : 'cancelled';
         await safeTrace(trace, {
           runId, type: 'tool.failed', timestamp: new Date().toISOString(),
           iteration, toolName, durationMs: Math.max(0, now() - toolStarted),
-          outcome: 'cancelled',
+          outcome,
         });
-        throw new AgentRunLimitError('deadline');
+        checkActive();
+        throw new AgentRunLimitError('cancelled');
       }
       await safeTrace(trace, {
         runId, type: 'tool.failed', timestamp: new Date().toISOString(),
@@ -228,18 +243,19 @@ export async function runAgent(
   const deadline = now() + (options.maxDurationMs ?? MAX_AGENT_DURATION_MS);
   const maxIterations = options.maxIterations ?? MAX_AGENT_ITERATIONS;
   const controller = new AbortController();
-  const cancelRun = () => controller.abort();
+  const cancelRun = () => controller.abort('cancelled');
   options.signal?.addEventListener('abort', cancelRun, {once: true});
   if (options.signal?.aborted) controller.abort();
   const runContext: ToolContext = {...context, signal: controller.signal};
   const deadlineTimer = setTimeout(
-    () => controller.abort(),
+    () => controller.abort('deadline'),
     Math.max(0, deadline - now()),
   );
-  const checkDeadline = (): void => {
-    if (now() >= deadline || controller.signal.aborted) {
+  const checkActive = (): void => {
+    if (now() >= deadline || controller.signal.reason === 'deadline') {
       throw new AgentRunLimitError('deadline');
     }
+    if (controller.signal.aborted) throw new AgentRunLimitError('cancelled');
   };
 
   const messages: Message[] =
@@ -252,7 +268,7 @@ export async function runAgent(
   let iteration = 0;
   try {
     while (true) {
-      checkDeadline();
+      checkActive();
       if (iteration >= maxIterations) {
         throw new AgentRunLimitError('iterations', maxIterations);
       }
@@ -286,16 +302,14 @@ export async function runAgent(
           iteration, durationMs: Math.max(0, monotonicNow() - modelStarted),
           outcome: error instanceof ContextBudgetError ? 'context_budget' : classifyError(error) === 'unknown' ? 'model' : classifyError(error),
         });
-        if (now() >= deadline || controller.signal.aborted) {
-          throw new AgentRunLimitError('deadline');
-        }
+        checkActive();
         throw error;
       }
       await safeTrace(trace, {
         runId, type: 'model.request.completed', timestamp: new Date().toISOString(),
         iteration, durationMs: Math.max(0, monotonicNow() - modelStarted),
       });
-      checkDeadline();
+      checkActive();
       messages.push(assistant);
 
       const calls = assistant.tool_calls ?? [];
@@ -311,7 +325,7 @@ export async function runAgent(
         messages,
         tools,
         runContext,
-        checkDeadline,
+        checkActive,
         trace,
         runId,
         iteration,
@@ -322,14 +336,7 @@ export async function runAgent(
     if (!terminalEmitted) {
       terminalEmitted = true;
       const category = classifyError(error);
-      const traceCategory =
-        category === 'deadline' &&
-        options.signal?.aborted &&
-        now() < deadline
-          ? 'cancelled'
-          : category === 'unknown'
-            ? 'model'
-            : category;
+      const traceCategory = category === 'unknown' ? 'model' : category;
       await safeTrace(trace, {
         runId,
         type: traceCategory === 'deadline' || traceCategory === 'cancelled'

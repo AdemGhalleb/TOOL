@@ -7,6 +7,7 @@ import {
 } from '../src/agent.ts';
 import {ToolCancellationError} from '../src/types.ts';
 import type {AssistantMessage, Message, ToolSpec} from '../src/types.ts';
+import {MemoryTraceSink} from '../src/tracing.ts';
 
 const context = {
   workspaceRoot: process.cwd(),
@@ -319,7 +320,7 @@ test('a cancelled run cannot start a tool operation', async () => {
       {signal: controller.signal, callModel: async () => toolCall()},
     ),
     (error: unknown) =>
-      error instanceof AgentRunLimitError && error.limit === 'deadline',
+      error instanceof AgentRunLimitError && error.limit === 'cancelled',
   );
   assert.equal(toolCalls, 0);
 });
@@ -361,7 +362,7 @@ test('cancellation rejects a pending approval and prevents its side effect', asy
   await assert.rejects(
     run,
     (error: unknown) =>
-      error instanceof AgentRunLimitError && error.limit === 'deadline',
+      error instanceof AgentRunLimitError && error.limit === 'cancelled',
   );
   assert.equal(sideEffects, 0);
 });
@@ -406,4 +407,41 @@ test('approval cancellation is isolated to its own run', async () => {
   assert.ok(result instanceof AgentRunLimitError);
   assert.equal(cancelledCalls, 0);
   assert.equal(otherCalls, 1);
+});
+
+test('cancellation during a tool reports one cancelled lifecycle and starts no next tool or model request', async () => {
+  const controller = new AbortController();
+  const sink = new MemoryTraceSink();
+  let modelCalls = 0;
+  let secondToolCalls = 0;
+  await assert.rejects(runAgent('cancel active tool', context, [], [
+    tool(async (_args, toolContext) => new Promise((_resolve, reject) => {
+      toolContext.signal?.addEventListener('abort', () => reject(new ToolCancellationError()), {once: true});
+      queueMicrotask(() => controller.abort());
+    })),
+    {...tool(async () => { secondToolCalls++; return 'bad'; }), definition: {
+      type: 'function', function: {name: 'second_tool', description: 'second', parameters: {type: 'object', properties: {}}},
+    }},
+  ], {
+    signal: controller.signal,
+    trace: sink,
+    callModel: async () => { modelCalls++; return toolCall(); },
+  }), (error: unknown) => error instanceof AgentRunLimitError && error.limit === 'cancelled');
+  assert.equal(modelCalls, 1);
+  assert.equal(secondToolCalls, 0);
+  assert.equal(sink.events.filter(event => event.type === 'tool.failed' && event.outcome === 'cancelled').length, 1);
+  assert.equal(sink.events.filter(event => event.type === 'tool.completed').length, 0);
+  assert.equal(sink.events.filter(event => event.type === 'run.cancelled').length, 1);
+});
+
+test('deadline expiration reaches an executing tool and retains the deadline outcome', async () => {
+  const sink = new MemoryTraceSink();
+  await assert.rejects(runAgent('deadline active tool', context, [], [tool(async (_args, toolContext) =>
+    new Promise((_resolve, reject) => toolContext.signal?.addEventListener('abort', () => reject(new ToolCancellationError()), {once: true})))], {
+    maxDurationMs: 20,
+    trace: sink,
+    callModel: async () => toolCall(),
+  }), (error: unknown) => error instanceof AgentRunLimitError && error.limit === 'deadline');
+  assert.equal(sink.events.filter(event => event.type === 'tool.failed' && event.outcome === 'deadline').length, 1);
+  assert.equal(sink.events.find(event => event.type === 'run.cancelled')?.outcome, 'deadline');
 });
