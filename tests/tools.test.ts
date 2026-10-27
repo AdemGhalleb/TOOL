@@ -372,7 +372,8 @@ test('Unix cancellation terminates a child process in the command process group'
   }
   await withTempWorkspace(async workspaceRoot => {
     const controller = new AbortController();
-    const watcher = watch(workspaceRoot);
+    const watcherController = new AbortController();
+    const watcher = watch(workspaceRoot, {signal: watcherController.signal});
     let run: Promise<unknown> | undefined;
     try {
       const childPidReady = (async () => {
@@ -395,7 +396,7 @@ test('Unix cancellation terminates a child process in the command process group'
       await assert.rejects(run, ToolCancellationError);
       assert.throws(() => process.kill(childPid, 0), {code: 'ESRCH'});
     } finally {
-      watcher.close();
+      watcherController.abort();
       if (!controller.signal.aborted) controller.abort();
       await run?.catch(() => {});
     }
