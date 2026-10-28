@@ -112,15 +112,16 @@ model request afterward. A cancelled tool is traced as failed with the
 
 Approved shell commands receive a graceful stop request first and a forced stop
 after 500 ms. Unix-like systems run commands in a separate process group and
-signal that group. Windows uses `taskkill.exe` with `/T` and then `/F` to stop
-the command tree, with a direct-child fallback if `taskkill` cannot be used.
-Windows process-tree cleanup is best effort because Node does not expose Job
-Objects directly and the system utility may be unavailable or denied. The
-command tool waits for the child's `close` event before reporting cancellation;
-if closure cannot be confirmed within five seconds after termination starts, it
-returns a cleanup failure instead of claiming the process exited. Captured
-output remains bounded, command environments remain allowlisted, and the
-existing ten-second command timeout is preserved.
+signal that group. Windows waits for `taskkill.exe` with `/T` and then `/F` to
+finish; if the utility cannot be launched or reports failure, a direct-child
+fallback is attempted but is not treated as tree cleanup. Windows process-tree
+cleanup remains best effort because Node does not expose Job Objects directly
+and descendants can escape the process group or utility's control. A cancelled
+command waits for the child close event and the active termination helper before
+reporting cancellation. If closure or tree termination cannot be confirmed, it
+returns a cleanup failure instead of claiming the command was fully stopped.
+Captured output remains bounded, command environments remain allowlisted, and
+the existing ten-second command timeout is preserved.
 
 Filesystem reads and searches stop at cancellation boundaries; an in-flight
 filesystem request cannot always be interrupted. Approved writes and deletes

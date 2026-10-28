@@ -54,21 +54,36 @@ function appendBounded(chunks: Buffer[], chunk: Buffer, total: {value: number}):
   return total.value > COMMAND_MAX_BUFFER;
 }
 
-function invokeTaskkill(pid: number, force: boolean): void {
+function invokeTaskkill(pid: number, force: boolean): Promise<boolean> {
   const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT;
   const executable = systemRoot
     ? join(systemRoot, 'System32', 'taskkill.exe')
     : 'taskkill.exe';
-  const killer = spawn(executable, ['/PID', String(pid), '/T', ...(force ? ['/F'] : [])], {
-    stdio: 'ignore', windowsHide: true,
+  return new Promise(resolveTaskkill => {
+    let killer: ChildProcess;
+    try {
+      killer = spawn(executable, ['/PID', String(pid), '/T', ...(force ? ['/F'] : [])], {
+        stdio: 'ignore', windowsHide: true,
+      });
+    } catch {
+      resolveTaskkill(false);
+      return;
+    }
+
+    let settled = false;
+    const settle = (succeeded: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(limit);
+      resolveTaskkill(succeeded);
+    };
+    const limit = setTimeout(() => {
+      try { killer.kill(); } catch {}
+      settle(false);
+    }, COMMAND_CLOSE_TIMEOUT_MS);
+    killer.once('error', () => settle(false));
+    killer.once('close', code => settle(code === 0));
   });
-  const fallback = () => {
-    // Keep the direct child stoppable if taskkill is unavailable or denies access.
-    // This cannot guarantee termination of descendants, which is documented below.
-    try { process.kill(pid, force ? 'SIGKILL' : 'SIGTERM'); } catch {}
-  };
-  killer.on('error', fallback);
-  killer.once('exit', code => { if (code !== 0) fallback(); });
 }
 
 export function executeCommand(
@@ -101,25 +116,41 @@ export function executeCommand(
     let timeout: NodeJS.Timeout | undefined;
     let closeTimeout: NodeJS.Timeout | undefined;
     let closed = false;
-    const sendSignal = (force: boolean): void => {
+    let treeCleanupFailed = false;
+    let termination: Promise<void> = Promise.resolve();
+    const sendSignal = (force: boolean): Promise<void> => {
       if (process.platform === 'win32') {
-        if (child.pid) invokeTaskkill(child.pid, force);
-        else child.kill(force ? 'SIGKILL' : 'SIGTERM');
+        if (!child.pid) {
+          child.kill(force ? 'SIGKILL' : 'SIGTERM');
+          return Promise.resolve();
+        }
+        const attempt = invokeTaskkill(child.pid, force).then(succeeded => {
+          if (!succeeded) {
+            treeCleanupFailed = true;
+            // Keep the direct child stoppable if taskkill is unavailable or denies access.
+            try { child.kill(force ? 'SIGKILL' : 'SIGTERM'); } catch {}
+          } else if (force) {
+            treeCleanupFailed = false;
+          }
+        });
+        termination = attempt;
+        return attempt;
       } else {
         try {
           if (child.pid) process.kill(-child.pid, force ? 'SIGKILL' : 'SIGTERM');
           else child.kill(force ? 'SIGKILL' : 'SIGTERM');
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === 'ESRCH') return;
+          if ((error as NodeJS.ErrnoException).code === 'ESRCH') return Promise.resolve();
           child.kill(force ? 'SIGKILL' : 'SIGTERM');
         }
+        return Promise.resolve();
       }
     };
     const beginStop = (reason: typeof stopReason): void => {
       if (closed || stopReason) return;
       stopReason = reason;
-      sendSignal(false);
-      escalation = setTimeout(() => sendSignal(true), COMMAND_TERMINATION_GRACE_MS);
+      void sendSignal(false);
+      escalation = setTimeout(() => { void sendSignal(true); }, COMMAND_TERMINATION_GRACE_MS);
       closeTimeout = setTimeout(() => {
         if (closed) return;
         cleanup();
@@ -143,13 +174,18 @@ export function executeCommand(
     child.once('spawn', () => {
       options.onSpawn?.();
       // An abort can race with asynchronous process creation before a PID exists.
-      if (stopReason) sendSignal(false);
+      if (stopReason) void sendSignal(false);
     });
-    child.once('close', (code, signal) => {
+    child.once('close', async (code, signal) => {
       closed = true;
       options.onClose?.();
       cleanup();
+      await termination;
       if (stopReason === 'cancelled') {
+        if (treeCleanupFailed) {
+          rejectCommand(new Error('Could not confirm command process-tree termination.'));
+          return;
+        }
         rejectCommand(new ToolCancellationError());
         return;
       }
