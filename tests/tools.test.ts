@@ -32,16 +32,17 @@ async function withTempWorkspace(
   }
 }
 
-async function waitForProcessExit(pid: number): Promise<void> {
+async function waitForProcessExit(pid: number): Promise<boolean> {
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
     try {
       process.kill(pid, 0);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return;
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true;
     }
     await new Promise(resolve => setTimeout(resolve, 25));
   }
+  return false;
 }
 
 test('command environment excludes secrets and arbitrary variables', () => {
@@ -416,7 +417,7 @@ test('cancellation terminates a spawned descendant', async t => {
       ]);
       controller.abort();
       await assert.rejects(run, ToolCancellationError);
-      assert.throws(() => process.kill(childPid, 0), {code: 'ESRCH'});
+      assert.equal(await waitForProcessExit(childPid), true);
     } finally {
       if (!controller.signal.aborted) controller.abort();
       await run?.catch(() => {});
