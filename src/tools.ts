@@ -19,6 +19,7 @@ export const COMMAND_TERMINATION_GRACE_MS = 500;
 const COMMAND_TIMEOUT_MS = 10_000;
 const COMMAND_CLOSE_TIMEOUT_MS = 5_000;
 const COMMAND_MAX_BUFFER = 1_000_000;
+const COMMAND_PROCESS_POLL_MS = 50;
 
 export const SEARCH_LIMITS = {
   maxFiles: 1_000,
@@ -54,6 +55,45 @@ function appendBounded(chunks: Buffer[], chunk: Buffer, total: {value: number}):
   return total.value > COMMAND_MAX_BUFFER;
 }
 
+function processStillExists(executable: string, pid: number): Promise<boolean> {
+  return new Promise(resolve => {
+    let checker: ChildProcess;
+    try {
+      checker = spawn(executable, ['/FI', `PID eq ${pid}`, '/NH'], {
+        stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true,
+      });
+    } catch {
+      resolve(true);
+      return;
+    }
+
+    let output = '';
+    checker.stdout?.on('data', chunk => { output += String(chunk); });
+    checker.once('error', () => resolve(true));
+    checker.once('close', code => {
+      resolve(code !== 0 || new RegExp(`\\b${pid}\\b`).test(output));
+    });
+  });
+}
+
+function waitForProcessExit(executable: string, pid: number): Promise<boolean> {
+  return new Promise(resolve => {
+    const deadline = Date.now() + COMMAND_CLOSE_TIMEOUT_MS;
+    const poll = async (): Promise<void> => {
+      if (!(await processStillExists(executable, pid))) {
+        resolve(true);
+        return;
+      }
+      if (Date.now() >= deadline) {
+        resolve(false);
+        return;
+      }
+      setTimeout(() => { void poll(); }, COMMAND_PROCESS_POLL_MS);
+    };
+    void poll();
+  });
+}
+
 function invokeTaskkill(pid: number, force: boolean): Promise<boolean> {
   const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT;
   const executable = systemRoot
@@ -82,7 +122,9 @@ function invokeTaskkill(pid: number, force: boolean): Promise<boolean> {
       settle(false);
     }, COMMAND_CLOSE_TIMEOUT_MS);
     killer.once('error', () => settle(false));
-    killer.once('close', code => settle(code === 0));
+    killer.once('close', async code => {
+      settle(code === 0 && await waitForProcessExit(executable, pid));
+    });
   });
 }
 

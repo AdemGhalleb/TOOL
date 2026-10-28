@@ -405,9 +405,10 @@ test('cancellation terminates a spawned descendant', async t => {
         }
         throw new Error('The child process did not start.');
       })();
-      const script = "const {spawn}=require('node:child_process');const fs=require('node:fs');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});fs.writeFileSync('child.pid',String(child.pid));fs.writeFileSync('parent.pid',String(process.pid));setInterval(()=>{},1000)";
+      const artifactRoot = workspaceRoot.replace(/\\/g, '/');
+      const script = `const {spawn}=require('node:child_process');const fs=require('node:fs');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});fs.writeFileSync('${artifactRoot}/child.pid',String(child.pid));fs.writeFileSync('${artifactRoot}/parent.pid',String(process.pid));setInterval(()=>{},1000)`;
       run = executeCommand(`node -e "${script}"`, {
-        cwd: workspaceRoot, env: buildCommandEnvironment(), signal: controller.signal,
+        cwd: process.cwd(), env: buildCommandEnvironment(), signal: controller.signal,
       });
       childPid = await Promise.race([
         childPidReady,
