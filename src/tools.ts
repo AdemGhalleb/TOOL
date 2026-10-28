@@ -117,19 +117,22 @@ export function executeCommand(
     let closeTimeout: NodeJS.Timeout | undefined;
     let closed = false;
     let treeCleanupFailed = false;
+    let treeCleanupConfirmed = false;
     let termination: Promise<void> = Promise.resolve();
     const sendSignal = (force: boolean): Promise<void> => {
       if (process.platform === 'win32') {
         if (!child.pid) {
+          treeCleanupFailed = true;
           child.kill(force ? 'SIGKILL' : 'SIGTERM');
           return Promise.resolve();
         }
         const attempt = invokeTaskkill(child.pid, force).then(succeeded => {
           if (!succeeded) {
-            treeCleanupFailed = true;
+            if (!treeCleanupConfirmed) treeCleanupFailed = true;
             // Keep the direct child stoppable if taskkill is unavailable or denies access.
             try { child.kill(force ? 'SIGKILL' : 'SIGTERM'); } catch {}
-          } else if (force) {
+          } else {
+            treeCleanupConfirmed = true;
             treeCleanupFailed = false;
           }
         });
