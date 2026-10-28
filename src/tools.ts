@@ -194,8 +194,11 @@ export function executeCommand(
     const beginStop = (reason: typeof stopReason): void => {
       if (closed || stopReason) return;
       stopReason = reason;
-      void sendSignal(false);
-      escalation = setTimeout(() => { void sendSignal(true); }, COMMAND_TERMINATION_GRACE_MS);
+      const forceImmediately = process.platform === 'win32' && reason === 'cancelled';
+      void sendSignal(forceImmediately);
+      if (!forceImmediately) {
+        escalation = setTimeout(() => { void sendSignal(true); }, COMMAND_TERMINATION_GRACE_MS);
+      }
       closeTimeout = setTimeout(() => {
         if (closed) return;
         cleanup();
