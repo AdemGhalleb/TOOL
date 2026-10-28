@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {mkdtemp, mkdir, readFile, rm, symlink, watch, writeFile} from 'node:fs/promises';
+import {mkdtemp, mkdir, readFile, rm, symlink, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {test} from 'node:test';
@@ -346,7 +346,11 @@ test('executeCommand rejects an already aborted signal before launching a proces
   });
 });
 
-test('executeCommand cancels a live process and waits for its close event', async () => {
+test('executeCommand cancels a live process and waits for its close event', async t => {
+  if (process.platform === 'win32' && !process.env.CI) {
+    t.skip('Windows process-tree cleanup requires the Windows CI environment.');
+    return;
+  }
   const controller = new AbortController();
   let announceSpawn!: () => void;
   const spawned = new Promise<void>(resolveSpawn => { announceSpawn = resolveSpawn; });
@@ -365,30 +369,35 @@ test('executeCommand cancels a live process and waits for its close event', asyn
   }
 });
 
-test('Unix cancellation terminates a child process in the command process group', async t => {
-  if (process.platform === 'win32') {
-    t.skip('Unix process-group integration check.');
+test('cancellation terminates a spawned descendant', async t => {
+  if (process.platform === 'win32' && !process.env.CI) {
+    t.skip('Windows process-tree cleanup requires the Windows CI environment.');
     return;
   }
   await withTempWorkspace(async workspaceRoot => {
     const controller = new AbortController();
-    const watcherController = new AbortController();
-    const watcher = watch(workspaceRoot, {signal: watcherController.signal});
     let run: Promise<unknown> | undefined;
+    let childPid: number | undefined;
+    let parentPid: number | undefined;
     try {
       const childPidReady = (async () => {
-        for await (const event of watcher) {
-          if (event.filename === 'child.pid') {
-            return Number(await readFile(join(workspaceRoot, 'child.pid'), 'utf8'));
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline) {
+          try {
+            const child = Number(await readFile(join(workspaceRoot, 'child.pid'), 'utf8'));
+            parentPid = Number(await readFile(join(workspaceRoot, 'parent.pid'), 'utf8'));
+            return child;
+          } catch {
+            await new Promise(resolve => setTimeout(resolve, 25));
           }
         }
         throw new Error('The child process did not start.');
       })();
-      const script = "const {spawn}=require('node:child_process');const fs=require('node:fs');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});fs.writeFileSync('child.pid',String(child.pid));setInterval(()=>{},1000)";
+      const script = "const {spawn}=require('node:child_process');const fs=require('node:fs');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});fs.writeFileSync('child.pid',String(child.pid));fs.writeFileSync('parent.pid',String(process.pid));setInterval(()=>{},1000)";
       run = executeCommand(`node -e "${script}"`, {
         cwd: workspaceRoot, env: buildCommandEnvironment(), signal: controller.signal,
       });
-      const childPid = await Promise.race([
+      childPid = await Promise.race([
         childPidReady,
         new Promise<number>((_, reject) => setTimeout(() => reject(new Error('Child process startup timed out.')), 5_000)),
       ]);
@@ -396,9 +405,14 @@ test('Unix cancellation terminates a child process in the command process group'
       await assert.rejects(run, ToolCancellationError);
       assert.throws(() => process.kill(childPid, 0), {code: 'ESRCH'});
     } finally {
-      watcherController.abort();
       if (!controller.signal.aborted) controller.abort();
       await run?.catch(() => {});
+      if (childPid !== undefined) {
+        try { process.kill(childPid, 'SIGKILL'); } catch {}
+      }
+      if (parentPid !== undefined) {
+        try { process.kill(parentPid, 'SIGKILL'); } catch {}
+      }
     }
   });
 });
