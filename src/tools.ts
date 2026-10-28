@@ -199,7 +199,7 @@ export function executeCommand(
       closeTimeout = setTimeout(() => {
         if (closed) return;
         cleanup();
-        rejectCommand(new Error('Could not confirm command process closure after termination.'));
+        rejectCommand(new ToolCleanupError());
       }, COMMAND_CLOSE_TIMEOUT_MS);
     };
     const onAbort = () => beginStop('cancelled');
