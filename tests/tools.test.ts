@@ -32,6 +32,18 @@ async function withTempWorkspace(
   }
 }
 
+async function waitForProcessExit(pid: number): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+}
+
 test('command environment excludes secrets and arbitrary variables', () => {
   const environment = buildCommandEnvironment({
     PATH: 'safe-path',
@@ -409,9 +421,11 @@ test('cancellation terminates a spawned descendant', async t => {
       await run?.catch(() => {});
       if (childPid !== undefined) {
         try { process.kill(childPid, 'SIGKILL'); } catch {}
+        await waitForProcessExit(childPid);
       }
       if (parentPid !== undefined) {
         try { process.kill(parentPid, 'SIGKILL'); } catch {}
+        await waitForProcessExit(parentPid);
       }
     }
   });

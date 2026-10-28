@@ -11,7 +11,7 @@ import {
 } from 'node:fs/promises';
 import {StringDecoder} from 'node:string_decoder';
 import {dirname, isAbsolute, join, relative, resolve, sep} from 'node:path';
-import {ToolCancellationError} from './types.ts';
+import {ToolCancellationError, ToolCleanupError} from './types.ts';
 import type {ToolSpec} from './types.ts';
 
 const MAX_TEXT = 12_000;
@@ -186,7 +186,7 @@ export function executeCommand(
       await termination;
       if (stopReason === 'cancelled') {
         if (treeCleanupFailed) {
-          rejectCommand(new Error('Could not confirm command process-tree termination.'));
+          rejectCommand(new ToolCleanupError());
           return;
         }
         rejectCommand(new ToolCancellationError());
@@ -534,7 +534,8 @@ const searchDirectoryTool: ToolSpec = {
     assertActive(context);
     const target = await boundedPath(context.workspaceRoot, path);
     assertActive(context);
-    const result = await searchFiles(context.workspaceRoot, target, query, context.signal);
+    const root = await realpath(context.workspaceRoot);
+    const result = await searchFiles(root, target, query, context.signal);
     assertActive(context);
 
     return result;

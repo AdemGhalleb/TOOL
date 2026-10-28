@@ -68,6 +68,14 @@ export class ToolCancellationError extends Error {
   }
 }
 
+export class ToolCleanupError extends ToolCancellationError {
+  constructor() {
+    super();
+    this.message = 'Tool operation cancelled, but process-tree cleanup could not be confirmed.';
+    this.name = 'ToolCleanupError';
+  }
+}
+
 export interface ChatCompletionResponse {
   choices: Array<{
     message: AssistantMessage;
