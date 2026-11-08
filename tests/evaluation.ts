@@ -71,12 +71,13 @@ function tool(
     type: 'object',
     properties: {},
   },
+  name = 'sample_tool',
 ): ToolSpec {
   return {
     definition: {
       type: 'function',
       function: {
-        name: 'sample_tool',
+        name,
         description: 'Controlled evaluation tool.',
         parameters,
       },
@@ -130,6 +131,203 @@ function scenario(
 }
 
 const scenarios: Scenario[] = [
+  scenario(
+    'dependent-tool-workflow',
+    'Dependent tools ground a final filesystem operation',
+    'listing, reading, extracting, and writing execute once in order with actual results passed between calls',
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'agent-harness-workflow-'));
+      try {
+        await writeFile(join(directory, 'report.txt'), 'status: ready\nowner: Ada\n', 'utf8');
+        const calls: string[] = [];
+        const requests: Message[][] = [];
+        let modelCalls = 0;
+        const result = await runAgent(
+          'Find the report status and write a summary.',
+          {...context, workspaceRoot: directory},
+          [],
+          [
+            tool(async () => {
+              calls.push('list_files');
+              return ['report.txt'];
+            }, {type: 'object', properties: {}, additionalProperties: false}, 'list_files'),
+            tool(async args => {
+              calls.push('read_file');
+              assert.equal(args.path, 'report.txt');
+              return await readFile(join(directory, 'report.txt'), 'utf8');
+            }, {
+              type: 'object',
+              properties: {path: {type: 'string'}},
+              required: ['path'],
+              additionalProperties: false,
+            }, 'read_file'),
+            tool(async args => {
+              calls.push('extract_status');
+              assert.equal(args.text, 'status: ready\nowner: Ada\n');
+              return 'ready';
+            }, {
+              type: 'object',
+              properties: {text: {type: 'string'}},
+              required: ['text'],
+              additionalProperties: false,
+            }, 'extract_status'),
+            tool(async args => {
+              calls.push('write_summary');
+              assert.equal(args.status, 'ready');
+              await writeFile(join(directory, String(args.path)), `status=${args.status}\n`, 'utf8');
+              return 'summary.txt';
+            }, {
+              type: 'object',
+              properties: {
+                path: {type: 'string'},
+                status: {type: 'string'},
+              },
+              required: ['path', 'status'],
+              additionalProperties: false,
+            }, 'write_summary'),
+          ],
+          {
+            callModel: async messages => {
+              requests.push(messages);
+              modelCalls++;
+              if (modelCalls === 1) return toolCall('{}', 'list_files');
+              if (modelCalls === 2) {
+                assert.ok(messages.at(-1)?.content.includes('report.txt'));
+                return toolCall('{"path":"report.txt"}', 'read_file');
+              }
+              if (modelCalls === 3) {
+                assert.ok(messages.at(-1)?.content.includes('status: ready'));
+                return toolCall('{"text":"status: ready\\nowner: Ada\\n"}', 'extract_status');
+              }
+              if (modelCalls === 4) {
+                assert.ok(messages.at(-1)?.content.includes('"data":"ready"'));
+                return toolCall('{"path":"summary.txt","status":"ready"}', 'write_summary');
+              }
+              assert.ok(messages.at(-1)?.content.includes('summary.txt'));
+              return {role: 'assistant', content: 'The report is ready; wrote summary.txt.'};
+            },
+          },
+        );
+
+        assert.equal(result.answer, 'The report is ready; wrote summary.txt.');
+        assert.deepEqual(calls, ['list_files', 'read_file', 'extract_status', 'write_summary']);
+        assert.equal(requests.length, 5);
+        assert.equal(await readFile(join(directory, 'summary.txt'), 'utf8'), 'status=ready\n');
+      } finally {
+        await rm(directory, {recursive: true, force: true});
+      }
+    },
+  ),
+  scenario(
+    'tool-recovery-without-retry',
+    'Tool failures recover without duplicating side effects',
+    'an invalid call is corrected, a failed primary is replaced by a successful alternative, and a write result prevents an implicit retry',
+    async () => {
+      let modelCalls = 0;
+      let primaryCalls = 0;
+      let backupCalls = 0;
+      let writes = 0;
+      const result = await runAgent(
+        'Recover the value and save it once.',
+        context,
+        [],
+        [
+          tool(async () => {
+            primaryCalls++;
+            throw new Error('primary unavailable');
+          }, {type: 'object', properties: {}, additionalProperties: false}, 'read_primary'),
+          tool(async args => {
+            backupCalls++;
+            assert.equal(args.key, 'status');
+            return 'ready';
+          }, {
+            type: 'object',
+            properties: {key: {type: 'string', minLength: 1}},
+            required: ['key'],
+            additionalProperties: false,
+          }, 'read_backup'),
+          tool(async args => {
+            writes++;
+            assert.equal(args.value, 'ready');
+            return 'saved';
+          }, {
+            type: 'object',
+            properties: {value: {type: 'string'}},
+            required: ['value'],
+            additionalProperties: false,
+          }, 'write_value'),
+        ],
+        {
+          callModel: async messages => {
+            modelCalls++;
+            if (modelCalls === 1) return toolCall('{}', 'read_primary');
+            if (modelCalls === 2) {
+              assert.ok(messages.at(-1)?.content.includes('primary unavailable'));
+              return toolCall('{"wrong":"status"}', 'read_backup');
+            }
+            if (modelCalls === 3) {
+              assert.ok(messages.at(-1)?.content.includes('"ok":false'));
+              return toolCall('{"key":"status"}', 'read_backup');
+            }
+            if (modelCalls === 4) {
+              assert.ok(messages.at(-1)?.content.includes('"data":"ready"'));
+              return toolCall('{"value":"ready"}', 'write_value');
+            }
+            assert.ok(messages.at(-1)?.content.includes('"data":"saved"'));
+            return {role: 'assistant', content: 'Recovered ready and saved it once.'};
+          },
+        },
+      );
+
+      assert.equal(result.answer, 'Recovered ready and saved it once.');
+      assert.equal(primaryCalls, 1);
+      assert.equal(backupCalls, 1);
+      assert.equal(writes, 1);
+      assert.equal(modelCalls, 5);
+    },
+  ),
+  scenario(
+    'multiple-tool-dispatch',
+    'Multiple model tool calls dispatch deterministically',
+    'tool calls in one response execute in response order with individual results and no extra calls',
+    async () => {
+      const calls: string[] = [];
+      let modelCalls = 0;
+      const result = await runAgent(
+        'Run both independent checks.',
+        context,
+        [],
+        [
+          tool(async () => { calls.push('first'); return 'first result'; }, undefined, 'first_check'),
+          tool(async () => { calls.push('second'); return 'second result'; }, undefined, 'second_check'),
+        ],
+        {
+          callModel: async messages => {
+            modelCalls++;
+            if (modelCalls === 1) {
+              return {
+                role: 'assistant',
+                content: null,
+                tool_calls: [
+                  {id: 'first-call', type: 'function', function: {name: 'first_check', arguments: '{}'}},
+                  {id: 'second-call', type: 'function', function: {name: 'second_check', arguments: '{}'}},
+                ],
+              };
+            }
+            assert.deepEqual(
+              messages.filter(message => message.role === 'tool').map(message => message.content),
+              ['{"ok":true,"data":"first result"}', '{"ok":true,"data":"second result"}'],
+            );
+            return {role: 'assistant', content: 'Both checks passed.'};
+          },
+        },
+      );
+
+      assert.equal(result.answer, 'Both checks passed.');
+      assert.deepEqual(calls, ['first', 'second']);
+      assert.equal(modelCalls, 2);
+    },
+  ),
   scenario(
     'successful-tool-use',
     'Successful tool use preserves the protocol exchange',
@@ -242,10 +440,14 @@ const scenarios: Scenario[] = [
     'approved operation runs; denied and cancelled operations do not',
     async () => {
       let sideEffects = 0;
+      const approvalActions: string[] = [];
       let modelCalls = 0;
       await runAgent(
         'approved operation',
-        context,
+        {...context, approve: async action => {
+          approvalActions.push(action);
+          return true;
+        }},
         [],
         [tool(async (_args, toolContext) => {
           assert.equal(await toolContext.approve('private action', toolContext.signal), true);
@@ -266,7 +468,10 @@ const scenarios: Scenario[] = [
       modelCalls = 0;
       await runAgent(
         'denied operation',
-        {...context, approve: async () => false},
+        {...context, approve: async action => {
+          approvalActions.push(action);
+          return false;
+        }},
         [],
         [tool(async (_args, toolContext) => {
           if (await toolContext.approve('denied action', toolContext.signal)) {
@@ -289,10 +494,11 @@ const scenarios: Scenario[] = [
       modelCalls = 0;
       const cancelledRun = runAgent(
         'cancelled operation',
-        {...context, approve: async () => {
-          controller.abort();
-          return true;
-        }},
+        {...context, approve: async (action, signal) => new Promise(resolve => {
+          approvalActions.push(action);
+          signal?.addEventListener('abort', () => resolve(false), {once: true});
+          queueMicrotask(() => controller.abort());
+        })},
         [],
         [tool(async (_args, toolContext) => {
           await toolContext.approve('cancelled action', toolContext.signal);
@@ -316,6 +522,11 @@ const scenarios: Scenario[] = [
       assert.equal(sideEffects, 1);
       assert.equal(deniedCalls, 0);
       assert.equal(cancellationSideEffects, 0);
+      assert.deepEqual(approvalActions, [
+        'private action',
+        'denied action',
+        'cancelled action',
+      ]);
     },
   ),
   scenario(
