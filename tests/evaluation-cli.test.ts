@@ -74,6 +74,17 @@ test('empty reports have a safe zero pass rate', () => {
   });
 });
 
+test('empty human-readable reports remain explicit and successful', async () => {
+  let output = '';
+  const exitCode = await runEvaluationCli([], {
+    run: async () => [],
+    stdout: text => { output += text; },
+  });
+
+  assert.equal(exitCode, 0);
+  assert.equal(output, 'Summary: 0/0 passed (0.0%)\n');
+});
+
 test('human-readable output remains available by default', async () => {
   let output = '';
   const exitCode = await runEvaluationCli([], {
@@ -84,6 +95,20 @@ test('human-readable output remains available by default', async () => {
   assert.equal(exitCode, 0);
   assert.match(output, /^PASS passing: Passing scenario\n/);
   assert.match(output, /Summary: 1\/1 passed \(100\.0%\)\n$/);
+});
+
+test('human-readable output reports runner failures on stderr', async () => {
+  let output = '';
+  let diagnostics = '';
+  const exitCode = await runEvaluationCli([], {
+    run: async () => { throw new Error('runner failed'); },
+    stdout: text => { output += text; },
+    stderr: text => { diagnostics += text; },
+  });
+
+  assert.equal(exitCode, 1);
+  assert.equal(output, '');
+  assert.equal(diagnostics, 'runner failed\n');
 });
 
 test('unsupported options are rejected', async () => {
