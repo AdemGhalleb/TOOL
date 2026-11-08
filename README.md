@@ -141,19 +141,27 @@ Run the cross-component runtime evaluations with:
 npm run eval
 ```
 
-The suite uses mocked model callbacks, controlled tools, fake clocks,
-temporary session files, and the in-memory trace sink. It covers successful
-tool protocol exchanges, invalid tool calls, approval and cancellation safety,
-execution failures and limits, bounded context handling, session recovery,
-trace integrity, and trace-sink isolation. Each scenario reports its own
-pass/fail result and expected outcome; the command exits nonzero if any
+The suite uses mocked model callbacks, controlled tools, isolated temporary
+files, fake clocks, and the in-memory trace sink. It covers successful tool
+protocol exchanges, dependent multi-step filesystem workflows, deterministic
+multiple-tool dispatch, invalid tool calls, fallback recovery after failures,
+approval and cancellation safety, execution limits, bounded context handling,
+session recovery, trace integrity, and trace-sink isolation. Each scenario
+asserts meaningful tool order and arguments, model-visible results, final
+responses, side effects, approvals, or trace events as applicable. It reports
+its own pass/fail result and expected outcome; the command exits nonzero if any
 scenario fails.
 
 To add a scenario, add a named entry to `tests/evaluation.ts` using injected
 `runAgent` dependencies and explicit assertions. A passing scenario means the
-runtime behavior matched those assertions. These evaluations measure
-deterministic runtime behavior under controlled responses, not model
-intelligence, real-world task success, or network/API reliability.
+runtime behavior matched those assertions. These evaluations establish runtime
+correctness and safety for the covered fixtures, plus deterministic behavior
+when model responses, tools, approvals, and clocks are controlled. They do not
+establish actual LLM reasoning or tool-selection quality, real-world task
+success, provider behavior, or network/API reliability. In particular, a
+passing fallback or tool-selection scenario proves that the runtime processes
+the supplied response safely; it is not evidence that a real model would
+choose the same action.
 
 The evaluations are also run in GitHub Actions on pushes and pull requests.
 They require no API keys, paid model providers, or external services. Use
