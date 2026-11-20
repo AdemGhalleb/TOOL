@@ -79,6 +79,7 @@ export class ToolCleanupError extends ToolCancellationError {
 export interface ChatCompletionResponse {
   choices: Array<{
     message: AssistantMessage;
+    finish_reason?: string | null;
   }>;
 }
 
