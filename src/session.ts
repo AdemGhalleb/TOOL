@@ -168,7 +168,25 @@ export function validateSessionData(value: unknown): Message[] {
   if (!Array.isArray(value) || value.length > SESSION_LIMITS.maxMessages) {
     throw new Error('Invalid session message list.');
   }
-  return value.map(validateMessage);
+  const messages = value.map(validateMessage);
+  const pending = new Map<string, number>();
+  for (const message of messages) {
+    if (message.role === 'assistant' && message.tool_calls) {
+      for (const call of message.tool_calls) {
+        pending.set(call.id, (pending.get(call.id) ?? 0) + 1);
+      }
+      continue;
+    }
+    if (message.role !== 'tool') continue;
+    const remaining = pending.get(message.tool_call_id) ?? 0;
+    if (remaining === 0) throw new Error('Invalid session tool-call exchange.');
+    if (remaining === 1) pending.delete(message.tool_call_id);
+    else pending.set(message.tool_call_id, remaining - 1);
+  }
+  if (pending.size > 0) {
+    throw new Error('Invalid session tool-call exchange.');
+  }
+  return messages;
 }
 
 function warnRecovery(path: string, reason: string): void {

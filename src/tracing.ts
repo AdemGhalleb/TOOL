@@ -6,6 +6,14 @@ export type TraceErrorCategory =
   | 'deadline'
   | 'iteration_limit'
   | 'model'
+  | 'provider_authentication'
+  | 'provider_invalid_request'
+  | 'provider_rate_limit'
+  | 'provider_server'
+  | 'provider_network'
+  | 'provider_timeout'
+  | 'provider_invalid_response'
+  | 'provider_validation'
   | 'tool'
   | 'unknown';
 
@@ -26,10 +34,17 @@ export interface RunTerminalEvent extends TraceBase {
 }
 
 export interface ModelRequestEvent extends TraceBase {
-  type: 'model.request.started' | 'model.request.completed' | 'model.request.failed';
+  type:
+    | 'model.request.started'
+    | 'model.request.completed'
+    | 'model.request.failed'
+    | 'model.retry'
+    | 'model.validation_failed';
   iteration: number;
   durationMs?: number;
   outcome?: TraceErrorCategory;
+  attempt?: number;
+  delayMs?: number;
 }
 
 export interface ContextPreparedEvent extends TraceBase {
@@ -92,6 +107,23 @@ export function monotonicNow(): number {
 }
 
 export function classifyError(error: unknown): TraceErrorCategory {
+  if (error && typeof error === 'object' && 'kind' in error) {
+    const kind = (error as {kind?: unknown}).kind;
+    if (kind === 'authentication') return 'provider_authentication';
+    if (kind === 'invalid_request') return 'provider_invalid_request';
+    if (kind === 'rate_limit') return 'provider_rate_limit';
+    if (kind === 'server') return 'provider_server';
+    if (kind === 'network') return 'provider_network';
+    if (kind === 'timeout') return 'provider_timeout';
+    if (kind === 'aborted') return 'cancelled';
+    if (
+      kind === 'invalid_json' ||
+      kind === 'invalid_response' ||
+      kind === 'empty_response' ||
+      kind === 'unexpected_finish' ||
+      kind === 'malformed_tool_call'
+    ) return 'provider_validation';
+  }
   if (error && typeof error === 'object' && 'name' in error) {
     const name = (error as {name?: unknown}).name;
     if (name === 'ContextBudgetError') return 'context_budget';

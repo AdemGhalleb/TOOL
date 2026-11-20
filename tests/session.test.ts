@@ -95,6 +95,23 @@ test('invalid roles, fields, and tool calls are rejected', () => {
   }
 });
 
+test('orphaned and incomplete tool-call exchanges are rejected', () => {
+  assert.throws(() => validateSessionData([{
+    role: 'assistant',
+    content: null,
+    tool_calls: [{
+      id: 'call-1',
+      type: 'function',
+      function: {name: 'tool', arguments: '{}'},
+    }],
+  }]));
+  assert.throws(() => validateSessionData([{
+    role: 'tool',
+    tool_call_id: 'call-1',
+    content: '{"ok":true}',
+  }]));
+});
+
 test('oversized files are rejected before reading their contents', async () => {
   let reads = 0;
   const fileSystem = {

@@ -8,6 +8,7 @@ import {
 import {ToolCancellationError} from '../src/types.ts';
 import type {AssistantMessage, Message, ToolSpec} from '../src/types.ts';
 import {MemoryTraceSink} from '../src/tracing.ts';
+import {ProviderError} from '../src/openrouter.ts';
 
 const context = {
   workspaceRoot: process.cwd(),
@@ -444,4 +445,58 @@ test('deadline expiration reaches an executing tool and retains the deadline out
   }), (error: unknown) => error instanceof AgentRunLimitError && error.limit === 'deadline');
   assert.equal(sink.events.filter(event => event.type === 'tool.failed' && event.outcome === 'deadline').length, 1);
   assert.equal(sink.events.find(event => event.type === 'run.cancelled')?.outcome, 'deadline');
+});
+
+test('provider failure after a successful tool side effect does not replay the tool', async () => {
+  let sideEffects = 0;
+  let modelCalls = 0;
+  await assert.rejects(
+    runAgent('tool then provider failure', context, [], [tool(async () => {
+      sideEffects++;
+      return 'completed';
+    })], {
+      callModel: async () => {
+        modelCalls++;
+        if (modelCalls === 1) return toolCall();
+        throw new ProviderError('server', 'provider unavailable', true);
+      },
+    }),
+  );
+  assert.equal(modelCalls, 2);
+  assert.equal(sideEffects, 1);
+});
+
+test('malformed model responses do not enter run history', async () => {
+  await assert.rejects(
+    runAgent('malformed', context, [], [], {
+      callModel: async () => ({role: 'assistant', content: null}),
+    }),
+  );
+});
+
+test('invalid tool-call structures do not dispatch tools or replay side effects', async () => {
+  let toolExecutions = 0;
+  let modelCalls = 0;
+  await assert.rejects(
+    runAgent('malformed tool call', context, [], [tool(async () => {
+      toolExecutions++;
+      return 'unexpected';
+    })], {
+      maxIterations: 1,
+      callModel: async () => {
+        modelCalls++;
+        return {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'duplicate',
+            type: 'function',
+            function: {name: 'sample_tool', arguments: '{'},
+          }],
+        };
+      },
+    }),
+  );
+  assert.equal(modelCalls, 1);
+  assert.equal(toolExecutions, 0);
 });

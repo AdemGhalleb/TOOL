@@ -1,10 +1,16 @@
-import {callModel} from './openrouter.ts';
+import {
+  callModel,
+  normalizeAssistantMessage,
+  ProviderError,
+  type ModelRequestOptions,
+} from './openrouter.ts';
 import {ContextBudgetError, prepareContextWithMetadata, type ContextBudget} from './context.ts';
 import {
   classifyError,
   createRunId,
   monotonicNow,
   noopTraceSink,
+  type TraceErrorCategory,
   type TraceSink,
 } from './tracing.ts';
 import {ToolCancellationError} from './types.ts';
@@ -48,6 +54,7 @@ export interface AgentRunOptions {
   signal?: AbortSignal;
   trace?: TraceSink;
   runId?: string;
+  modelRequest?: Omit<ModelRequestOptions, 'onRetry' | 'onValidationFailure'>;
 }
 
 export function validateToolArguments(
@@ -107,6 +114,17 @@ async function safeTrace(
   } catch {
     // Observability must never alter agent behavior.
   }
+}
+
+function classifyProviderKind(kind: string): TraceErrorCategory {
+  if (kind === 'authentication') return 'provider_authentication';
+  if (kind === 'invalid_request') return 'provider_invalid_request';
+  if (kind === 'rate_limit') return 'provider_rate_limit';
+  if (kind === 'server') return 'provider_server';
+  if (kind === 'network') return 'provider_network';
+  if (kind === 'timeout') return 'provider_timeout';
+  if (kind === 'aborted') return 'cancelled';
+  return 'provider_validation';
 }
 
 async function executeToolCalls(
@@ -281,6 +299,7 @@ export async function runAgent(
         iteration,
       });
       let assistant;
+      const modelCall = options.callModel ?? callModel;
       try {
         const prepared = prepareContextWithMetadata(messages, options.contextBudget);
         await safeTrace(trace, {
@@ -291,12 +310,39 @@ export async function runAgent(
           excludedGroupCount: prepared.excludedGroupCount,
           excludedMessageCount: prepared.excludedMessageCount,
         });
-        assistant = await (options.callModel ?? callModel)(
+        assistant = await modelCall(
           prepared.messages,
           tools,
           controller.signal,
+          modelCall === callModel
+            ? {
+                ...options.modelRequest,
+                deadlineMs: Math.max(0, deadline - now()),
+                onRetry: async (attempt, delayMs, kind) => {
+                  await safeTrace(trace, {
+                    runId, type: 'model.retry', timestamp: new Date().toISOString(),
+                    iteration, attempt, delayMs, outcome: classifyProviderKind(kind),
+                  });
+                },
+                onValidationFailure: async kind => {
+                  await safeTrace(trace, {
+                    runId, type: 'model.validation_failed', timestamp: new Date().toISOString(),
+                    iteration, outcome: classifyProviderKind(kind),
+                  });
+                },
+              }
+            : undefined,
         );
+        assistant = normalizeAssistantMessage(assistant, false);
       } catch (error) {
+        if (modelCall !== callModel && error instanceof ProviderError) {
+          if (['invalid_json', 'invalid_response', 'empty_response', 'unexpected_finish', 'malformed_tool_call'].includes(error.kind)) {
+            await safeTrace(trace, {
+              runId, type: 'model.validation_failed', timestamp: new Date().toISOString(),
+              iteration, outcome: classifyProviderKind(error.kind),
+            });
+          }
+        }
         await safeTrace(trace, {
           runId, type: 'model.request.failed', timestamp: new Date().toISOString(),
           iteration, durationMs: Math.max(0, monotonicNow() - modelStarted),
